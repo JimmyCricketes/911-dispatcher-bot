@@ -30,18 +30,23 @@ A complete Discord-to-Roblox communication system that allows Discord dispatcher
 ```
 
 **Flow:**
-1. Dispatcher types `!d <callId> <message>` in Discord
-2. Discord bot receives command and validates it
-3. Bot sends message to Roblox Open Cloud MessagingService API
-4. Roblox game receives message via MessagingService
-5. Message is delivered to the player's phone UI in-game
-6. Bot reacts with ✅ (success) or ❌ (failure)
+1. When a 911 call comes in (RINGING status), bot automatically pings dispatchers
+2. Dispatcher can use `!answer <callId>` to connect to the call
+3. Dispatcher types `!d <callId> <message>` in Discord to send messages
+4. Discord bot receives command and validates it
+5. Bot sends message to Roblox Open Cloud MessagingService API
+6. Roblox game receives message via MessagingService
+7. Message is delivered to the player's phone UI in-game
+8. Bot replies with "Sent" (success) or "Failed" (failure)
 
 ## ✨ Features
 
 - **Simple Command Interface**: Use `!d <callId> <message>` to send messages
+- **Answer Calls from Discord**: Use `!answer <callId>` to connect to incoming 911 calls
+- **Auto-Ping for New Calls**: Bot automatically alerts dispatchers when new 911 calls come in
+- **Bot Status Check**: Use `!status` to verify the bot is online
 - **Real-time Communication**: Messages delivered instantly via Roblox MessagingService
-- **Visual Feedback**: Bot reacts with ✅ or ❌ to confirm delivery
+- **Text-Based Feedback**: Bot replies with "Sent" or "Failed" to confirm delivery status
 - **Call ID Tracking**: Each emergency call has a unique ID for dispatcher replies
 - **Transcript Logging**: All dispatcher messages are logged in the call transcript
 - **Free Hosting**: Deploy on Railway.app for free (no credit card required)
@@ -181,12 +186,15 @@ A complete Discord-to-Roblox communication system that allows Discord dispatcher
 | Command | Description | Example |
 |---------|-------------|---------|
 | `!d <callId> <message>` | Send a message to an active 911 call | `!d 555-0123 Officers are on the way` |
+| `!answer <callId>` | Answer/connect to a ringing 911 call | `!answer 555-0123` |
+| `!status` | Check if the bot is online | `!status` |
 
 **Notes:**
 - `<callId>` can be either the log ID or the caller's phone number
-- The bot will react with ✅ if the message was sent successfully
-- The bot will react with ❌ if there was an error
+- The bot will reply with "Sent" if the message was sent successfully
+- The bot will reply with "Failed" if there was an error
 - Messages appear in the caller's phone UI as "911 Dispatch"
+- The bot automatically pings dispatchers when a new 911 call comes in (RINGING status)
 
 ## 🔧 Troubleshooting
 
