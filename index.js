@@ -92,7 +92,7 @@ client.on('messageCreate', async (msg) => {
                 if (match) callId = match[1];
             }
             
-            // Send ping message
+            // Send ping message - using hardcoded user ID as per requirements
             await msg.channel.send(`<@769664717614088193> INCOMING 911 CALL - Use !answer ${callId} to connect`);
         }
     }
