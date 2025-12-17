@@ -77,10 +77,8 @@ client.on('messageCreate', async (msg) => {
                 await thread.send(
                     `<@769664717614088193>\n` +
                     `**INCOMING 911 CALL**\n` +
-                    `Call ID: ${callId}\n` + // Re-added Call ID for clarity in the thread start message
-                    `Callback: ${callbackNumber}\n\n` +
                     `Send a message to answer and respond.\n` +
-                    `Type \`!hangup\` to end the call. `
+                    `\`!hangup\` to end call. `
                 );
 
             } catch (e) {
