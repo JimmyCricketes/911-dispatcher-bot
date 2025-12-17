@@ -21,14 +21,14 @@ const activeThreads = new Map();
 async function sendToRoblox(topic, data) {
     try {
         const res = await fetch(
-            `https://apis.roblox. com/messaging-service/v1/universes/${process.env. UNIVERSE_ID}/topics/${topic}`,
+            `https://apis.roblox.com/messaging-service/v1/universes/${process.env.UNIVERSE_ID}/topics/${topic}`,
             {
                 method:  'POST',
                 headers: { 
-                    'x-api-key': process. env.ROBLOX_API_KEY, 
+                    'x-api-key': process.env.ROBLOX_API_KEY, 
                     'Content-Type': 'application/json' 
                 },
-                body: JSON. stringify({ message: JSON.stringify(data) })
+                body: JSON.stringify({ message: JSON.stringify(data) })
             }
         );
         return res.ok;
@@ -40,24 +40,24 @@ async function sendToRoblox(topic, data) {
 
 // Monitor for new 911 call embeds and create threads
 client.on('messageCreate', async (msg) => {
-    if (! msg.author.bot || ! msg.embeds || msg.embeds.length === 0) return;
+    if (!msg.author.bot || !msg.embeds || msg.embeds.length === 0) return;
     
     const embed = msg.embeds[0];
     
-    if (embed.title && embed.title. includes('EMERGENCY CALL - 911')) {
-        const statusField = embed.fields?. find(f => f.name && f.name.includes('Status'));
+    if (embed.title && embed.title.includes('EMERGENCY CALL - 911')) {
+        const statusField = embed.fields?.find(f => f.name && f.name.includes('Status'));
         
-        if (statusField && statusField.value && statusField.value. includes('RINGING')) {
+        if (statusField && statusField.value && statusField.value.includes('RINGING')) {
             // Extract callId from description
             let callId = 'unknown';
             if (embed.description) {
-                const match = embed.description. match(/Call ID:\s*(\S+)/);
+                const match = embed.description.match(/Call ID:\s*(\S+)/);
                 if (match) callId = match[1];
             }
             
             // Extract callback number
             let callbackNumber = 'Unknown';
-            const callbackField = embed.fields?. find(f => f.name && f. name.includes('Callback'));
+            const callbackField = embed.fields?.find(f => f.name && f.name.includes('Callback'));
             if (callbackField && callbackField.value) {
                 callbackNumber = callbackField.value;
             }
@@ -82,8 +82,8 @@ client.on('messageCreate', async (msg) => {
                 );
                 
             } catch (e) {
-                console. error('[Thread Error]:', e);
-                await msg.channel.send(`<@769664717614088193> INCOMING 911 CALL - Use ! answer ${callId} to connect`);
+                console.error('[Thread Error]:', e);
+                await msg.channel.send(`<@769664717614088193> INCOMING 911 CALL - Use !answer ${callId} to connect`);
             }
         }
     }
@@ -94,8 +94,8 @@ client.on('messageCreate', async (msg) => {
     if (msg.author.bot) return;
     
     // Check if in active call thread
-    if (msg.channel.type === ChannelType.PublicThread || msg.channel.type === ChannelType. PrivateThread) {
-        const threadData = activeThreads. get(msg.channel.id);
+    if (msg.channel.type === ChannelType.PublicThread || msg.channel.type === ChannelType.PrivateThread) {
+        const threadData = activeThreads.get(msg.channel.id);
         
         if (threadData) {
             const { callId, answered } = threadData;
@@ -110,7 +110,7 @@ client.on('messageCreate', async (msg) => {
                 
                 if (success) {
                     threadData.answered = true;
-                    activeThreads.set(msg.channel. id, threadData);
+                    activeThreads.set(msg.channel.id, threadData);
                 } else {
                     await msg.reply('Failed to connect to call.');
                     return;
@@ -121,10 +121,10 @@ client.on('messageCreate', async (msg) => {
             const success = await sendToRoblox('DispatcherMessage', {
                 callId: callId,
                 text: msg.content,
-                dispatcher: msg.author. username
+                dispatcher: msg.author.username
             });
             
-            if (! success) {
+            if (!success) {
                 await msg.reply('Failed');
             }
             
@@ -138,24 +138,24 @@ client.on('messageCreate', async (msg) => {
         return;
     }
     
-    if (msg. content. startsWith('!answer ')) {
+    if (msg.content.startsWith('!answer ')) {
         const callId = msg.content.slice(8).trim();
-        if (! callId) {
+        if (!callId) {
             msg.reply('Usage: !answer <callId>');
             return;
         }
         const success = await sendToRoblox('DispatcherAction', {
             callId: callId,
             action: 'answer',
-            dispatcher: msg.author. username
+            dispatcher: msg.author.username
         });
         msg.reply(success ? 'Sent' : 'Failed');
         return;
     }
     
-    if (msg. content.startsWith('! d ')) {
-        const args = msg.content. slice(3).trim().split(' ');
-        const callId = args. shift();
+    if (msg.content.startsWith('!d ')) {
+        const args = msg.content.slice(3).trim().split(' ');
+        const callId = args.shift();
         const text = args.join(' ');
         if (!callId || !text) {
             msg.reply('Usage: !d <callId> <message>');
@@ -172,4 +172,4 @@ client.on('messageCreate', async (msg) => {
 });
 
 client.once('ready', () => console.log('Bot ready! '));
-client.login(process.env. DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN);
