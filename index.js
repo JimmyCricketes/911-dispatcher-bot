@@ -1,5 +1,5 @@
 /**
- * 911 Dispatcher Bot v3.3 (Hardened + Fixed)
+ * 911 Dispatcher Bot v3.4 (Fixed Duplicates & Cleaned)
  * Discord <-> Roblox emergency call bridge
  */
 
@@ -13,7 +13,10 @@ const crypto = require('crypto');
 // Environment validation
 const REQUIRED_ENV = ['DISCORD_TOKEN', 'UNIVERSE_ID', 'ROBLOX_API_KEY', 'DISPATCHER_PING'];
 const missing = REQUIRED_ENV.filter(k => !process.env[k]?.trim());
-if (missing.length) { console.error(`Missing env vars: ${missing.join(', ')}`); process.exit(1); }
+if (missing.length) {
+    console.error(`Missing env vars: ${missing.join(', ')}`);
+    process.exit(1);
+}
 
 // Configuration
 const CFG = {
@@ -52,15 +55,14 @@ const RE = {
     },
 };
 
-// Logging with correlation ID support
+// Logging
 const LOG_LEVEL = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
 const logLevel = LOG_LEVEL[process.env.LOG_LEVEL?.toUpperCase()] ?? LOG_LEVEL.INFO;
 
 const log = {
     fmt: (lvl, msg, meta) => {
-        const correlationId = meta?.correlationId || '';
         const metaStr = meta ? ' ' + JSON.stringify(meta) : '';
-        return `[${new Date().toISOString()}] [${lvl}]${correlationId ? ` [${correlationId}]` : ''} ${msg}${metaStr}`;
+        return `[${new Date().toISOString()}] [${lvl}] ${msg}${metaStr}`;
     },
     debug: (msg, meta) => logLevel <= LOG_LEVEL.DEBUG && console.log(log.fmt('DEBUG', msg, meta)),
     info: (msg, meta) => logLevel <= LOG_LEVEL.INFO && console.log(log.fmt('INFO', msg, meta)),
@@ -71,14 +73,12 @@ const log = {
 // Utilities
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const sanitize = text => (text || '').substring(0, CFG.limits.msgLength).replace(/[\x00-\x1F\x7F]/g, '').trim();
-const sanitizeUsername = username => (username || 'Unknown')
-    .replace(/[^\w\s-]/g, '')
-    .substring(0, CFG.limits.usernameMax)
-    .trim() || 'Dispatcher';
+const sanitizeUsername = username =>
+    (username || 'Unknown').replace(/[^\w\s-]/g, '').substring(0, CFG.limits.usernameMax).trim() || 'Dispatcher';
 const validCallId = id => typeof id === 'string' && RE.callId.test(id);
-const generateCorrelationId = (callId) => `${callId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+const generateCorrelationId = callId => `${callId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
 
-// Rate Limiter (Generic)
+// Rate Limiter
 class RateLimiter {
     constructor(perSec) {
         this.tokens = perSec;
@@ -91,7 +91,10 @@ class RateLimiter {
             const now = Date.now();
             this.tokens = Math.min(this.max, this.tokens + ((now - this.last) / 1000) * this.max);
             this.last = now;
-            if (this.tokens >= 1) { this.tokens--; return; }
+            if (this.tokens >= 1) {
+                this.tokens--;
+                return;
+            }
             await sleep(Math.ceil(((1 - this.tokens) / this.max) * 1000));
         }
     }
@@ -137,39 +140,53 @@ class CircuitBreaker {
 
 const circuit = new CircuitBreaker(CFG.circuit.threshold, CFG.circuit.resetMs);
 
-// Processed Calls Tracker (LRU with TTL)
+// Processed Calls Tracker
 class ProcessedCallsTracker {
-    #calls = new Map();
+    #callIds = new Map();
+    #messageIds = new Set();
 
-    mark(callId, correlationId) {
-        this.#calls.set(callId, { timestamp: Date.now(), correlationId });
+    markCallId(callId, correlationId) {
+        this.#callIds.set(callId, { timestamp: Date.now(), correlationId });
         this.#evict();
     }
 
-    has(callId) {
-        const entry = this.#calls.get(callId);
-        if (!entry) return false;
+    markMessageId(messageId) {
+        this.#messageIds.add(messageId);
+    }
 
+    hasCallId(callId) {
+        const entry = this.#callIds.get(callId);
+        if (!entry) return false;
         if (Date.now() - entry.timestamp > CFG.processedCalls.ttlMs) {
-            this.#calls.delete(callId);
+            this.#callIds.delete(callId);
             return false;
         }
         return true;
     }
 
-    #evict() {
-        if (this.#calls.size <= CFG.processedCalls.maxSize) return;
+    hasMessageId(messageId) {
+        return this.#messageIds.has(messageId);
+    }
 
-        const entries = [...this.#calls.entries()]
+    #evict() {
+        if (this.#callIds.size <= CFG.processedCalls.maxSize) return;
+
+        const entries = [...this.#callIds.entries()]
             .sort((a, b) => a[1].timestamp - b[1].timestamp)
             .slice(0, CFG.processedCalls.evictCount);
 
-        entries.forEach(([id]) => this.#calls.delete(id));
-        log.info('Evicted old processed calls', { evicted: entries.length });
+        entries.forEach(([id]) => this.#callIds.delete(id));
+
+        if (this.#messageIds.size > CFG.processedCalls.maxSize) {
+            const toDelete = [...this.#messageIds].slice(0, CFG.processedCalls.evictCount);
+            toDelete.forEach(id => this.#messageIds.delete(id));
+        }
+
+        log.info('Evicted old processed entries', { evicted: entries.length });
     }
 
     size() {
-        return this.#calls.size;
+        return this.#callIds.size;
     }
 }
 
@@ -285,7 +302,7 @@ class ThreadManager {
             answered: false,
             lastActivity: Date.now(),
             messages: 0,
-            archived: false
+            archived: false,
         };
         const node = new LRUNode(threadId, data);
 
@@ -295,7 +312,7 @@ class ThreadManager {
 
         this.#stats.active++;
         this.#stats.created++;
-        log.info('Thread created', { threadId, callId, callType, correlationId });
+        log.info('Thread created', { threadId, callId, callType });
         return data;
     }
 
@@ -357,7 +374,7 @@ class ThreadManager {
         if (node.value.answered) this.#stats.answered--;
         this.#stats.closed++;
 
-        log.info('Thread closed', { threadId, callId: node.value.callId, reason, correlationId: node.value.correlationId });
+        log.info('Thread closed', { threadId, callId: node.value.callId, reason });
         return node.value;
     }
 
@@ -391,11 +408,15 @@ class ThreadManager {
 
         for (const data of stale) {
             if (data.answered && !data.archived) {
-                await sendToRoblox('DispatcherAction', {
-                    callId: data.callId,
-                    action: 'hangup',
-                    dispatcher: 'System'
-                }, data.correlationId);
+                await sendToRoblox(
+                    'DispatcherAction',
+                    {
+                        callId: data.callId,
+                        action: 'hangup',
+                        dispatcher: 'System',
+                    },
+                    data.correlationId
+                );
             }
             this.close(data.threadId, 'stale');
 
@@ -466,7 +487,7 @@ async function sendToRoblox(topic, data, correlationId) {
                 if (result.status === 429) {
                     const retryHeader = result.headers['retry-after'];
                     const retry = parseInt(retryHeader, 10);
-                    const waitMs = (!isNaN(retry) && retry > 0) ? retry * 1000 : CFG.rate.baseDelayMs;
+                    const waitMs = !isNaN(retry) && retry > 0 ? retry * 1000 : CFG.rate.baseDelayMs;
                     log.warn('Roblox rate limited', { retryAfter: retry, correlationId });
                     await sleep(Math.min(waitMs, CFG.rate.maxDelayMs));
                     continue;
@@ -481,10 +502,7 @@ async function sendToRoblox(topic, data, correlationId) {
             } catch (err) {
                 log.warn('Roblox API failed', { topic, attempt, error: err.message, correlationId });
                 if (attempt < CFG.rate.retries) {
-                    const delay = Math.min(
-                        CFG.rate.baseDelayMs * Math.pow(2, attempt - 1),
-                        CFG.rate.maxDelayMs
-                    );
+                    const delay = Math.min(CFG.rate.baseDelayMs * Math.pow(2, attempt - 1), CFG.rate.maxDelayMs);
                     await sleep(delay);
                 }
             }
@@ -500,27 +518,32 @@ async function sendToRoblox(topic, data, correlationId) {
 function robloxRequest(topic, data, correlationId) {
     return new Promise((resolve, reject) => {
         const body = JSON.stringify({ message: JSON.stringify(data) });
-        const req = https.request({
-            hostname: CFG.roblox.host,
-            path: `${CFG.roblox.path}/universes/${CFG.roblox.universeId}/topics/${topic}`,
-            method: 'POST',
-            agent,
-            headers: {
-                'x-api-key': CFG.roblox.apiKey,
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(body),
-                'X-Correlation-ID': correlationId || 'unknown',
+        const req = https.request(
+            {
+                hostname: CFG.roblox.host,
+                path: `${CFG.roblox.path}/universes/${CFG.roblox.universeId}/topics/${topic}`,
+                method: 'POST',
+                agent,
+                headers: {
+                    'x-api-key': CFG.roblox.apiKey,
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(body),
+                    'X-Correlation-ID': correlationId || 'unknown',
+                },
+                timeout: CFG.roblox.timeoutMs,
             },
-            timeout: CFG.roblox.timeoutMs,
-        }, res => {
-            let responseData = '';
-            res.on('data', chunk => responseData += chunk);
-            res.on('end', () => resolve({
-                status: res.statusCode,
-                headers: res.headers,
-                body: responseData
-            }));
-        });
+            res => {
+                let responseData = '';
+                res.on('data', chunk => (responseData += chunk));
+                res.on('end', () =>
+                    resolve({
+                        status: res.statusCode,
+                        headers: res.headers,
+                        body: responseData,
+                    })
+                );
+            }
+        );
         req.on('error', reject);
         req.on('timeout', () => {
             req.destroy();
@@ -531,17 +554,15 @@ function robloxRequest(topic, data, correlationId) {
     });
 }
 
-// Embed parsing - Fixed to match Roblox webhook format
+// Embed parsing
 function parseEmbed(embed) {
     if (!embed?.title) return null;
 
-    // Check title for call type
     const callType = embed.title.includes('911') ? '911' : embed.title.includes('311') ? '311' : null;
     if (!callType) return null;
 
     let callId = null;
 
-    // Extract Call ID from description (format: "Call ID: E02A013")
     if (embed.description) {
         const match = embed.description.match(/Call\s*ID[:\s]+([A-Za-z0-9_-]+)/i);
         if (match?.[1] && validCallId(match[1])) {
@@ -549,7 +570,6 @@ function parseEmbed(embed) {
         }
     }
 
-    // Also check fields for Call ID as fallback
     let status = null;
     let callback = 'Unknown';
 
@@ -576,11 +596,7 @@ function parseEmbed(embed) {
 
 // Discord client
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ],
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
 const threads = new ThreadManager();
@@ -607,12 +623,9 @@ client.on('messageCreate', async msg => {
     if (!msg.author) return;
 
     try {
-        // Process webhook messages (from Roblox) for thread creation
         if (msg.webhookId && msg.embeds?.length) {
             await handleIncoming(msg);
-        }
-        // Process user messages for commands and call responses
-        else if (!msg.author.bot && msg.content?.trim()) {
+        } else if (!msg.author.bot && msg.content?.trim()) {
             await handleUser(msg);
         }
     } catch (err) {
@@ -622,39 +635,41 @@ client.on('messageCreate', async msg => {
 
 // Handle incoming webhook messages from Roblox
 async function handleIncoming(msg) {
+    if (processedCalls.hasMessageId(msg.id)) {
+        log.debug('Duplicate message ignored', { messageId: msg.id });
+        return;
+    }
+    processedCalls.markMessageId(msg.id);
+
     const parsed = parseEmbed(msg.embeds[0]);
     if (!parsed?.callType || !parsed.callId) {
         log.debug('Invalid embed format', { hasTitle: !!msg.embeds[0]?.title });
         return;
     }
 
-    // Only create threads for RINGING calls
     if (!parsed.status?.toUpperCase().includes('RINGING')) {
         log.debug('Ignoring non-ringing status', { status: parsed.status, callId: parsed.callId });
         return;
     }
 
-    // Skip if already processed
-    if (processedCalls.has(parsed.callId)) {
+    if (processedCalls.hasCallId(parsed.callId)) {
         log.debug('Duplicate call ignored', { callId: parsed.callId });
         return;
     }
 
-    // Skip if thread already exists
     if (threads.hasCallId(parsed.callId)) {
         log.debug('Thread already exists', { callId: parsed.callId });
         return;
     }
 
     const correlationId = generateCorrelationId(parsed.callId);
-    processedCalls.mark(parsed.callId, correlationId);
+    processedCalls.markCallId(parsed.callId, correlationId);
 
     try {
-        // Create thread directly on the webhook message (no re-posting!)
         await discordLimiter.acquire();
         const thread = await msg.startThread({
             name: `${parsed.callType} Call - ${parsed.callId}`.substring(0, CFG.limits.threadNameMax),
-            autoArchiveDuration: CFG.threads.archiveMins
+            autoArchiveDuration: CFG.threads.archiveMins,
         });
 
         const threadData = threads.create(thread.id, parsed.callId, parsed.callType, correlationId);
@@ -667,24 +682,21 @@ async function handleIncoming(msg) {
         await discordLimiter.acquire();
         await thread.send(
             `<@${CFG.dispatcher}>\n` +
-            `**INCOMING ${parsed.callType} ${type} CALL**\n` +
-            `Callback: ${parsed.callback}\n` +
-            `Call ID: \`${parsed.callId}\`\n` +
-            `Correlation: \`${correlationId}\`\n\n` +
-            `Send a message to answer.\n` +
-            `\`!hangup\` to end.`
+                `**INCOMING ${parsed.callType} ${type} CALL**\n\n` +
+                `Send a message to answer.\n` +
+                '`!hangup` to end.'
         );
 
-        log.info('Thread created on webhook message', { threadId: thread.id, callId: parsed.callId, correlationId });
+        log.info('Thread created on webhook message', { threadId: thread.id, callId: parsed.callId });
     } catch (err) {
-        log.error('Thread creation failed', { error: err.message, callId: parsed.callId, correlationId });
+        log.error('Thread creation failed', { error: err.message, callId: parsed.callId });
     }
 }
 
 async function handleUser(msg) {
     const content = msg.content.trim();
-    const isThread = msg.channel.type === ChannelType.PublicThread ||
-                     msg.channel.type === ChannelType.PrivateThread;
+    const isThread =
+        msg.channel.type === ChannelType.PublicThread || msg.channel.type === ChannelType.PrivateThread;
 
     if (isThread) {
         const data = threads.get(msg.channel.id);
@@ -701,12 +713,16 @@ async function handleThread(msg, data, content) {
     const { callId, answered, callType, correlationId } = data;
 
     if (RE.cmd.hangup.test(content)) {
-        const result = await sendToRoblox('DispatcherAction', {
-            callId,
-            action: 'hangup',
-            dispatcher: msg.author.username,
-            threadId: msg.channel.id,
-        }, correlationId);
+        const result = await sendToRoblox(
+            'DispatcherAction',
+            {
+                callId,
+                action: 'hangup',
+                dispatcher: msg.author.username,
+                threadId: msg.channel.id,
+            },
+            correlationId
+        );
 
         if (result.success) {
             await msg.reply(`${callType} call ended.`);
@@ -723,30 +739,38 @@ async function handleThread(msg, data, content) {
     if (!text) return;
 
     if (!answered) {
-        const result = await sendToRoblox('DispatcherAction', {
-            callId,
-            action: 'answer',
-            dispatcher: msg.author.username,
-            message: text,
-            threadId: msg.channel.id,
-        }, correlationId);
+        const result = await sendToRoblox(
+            'DispatcherAction',
+            {
+                callId,
+                action: 'answer',
+                dispatcher: msg.author.username,
+                message: text,
+                threadId: msg.channel.id,
+            },
+            correlationId
+        );
 
         if (result.success) {
             threads.markAnswered(msg.channel.id);
             threads.recordMessage(msg.channel.id);
-            await msg.reply(`📞 Connected! Your message was sent to the caller.`);
+            await msg.reply('📞 Connected! Your message was sent to the caller.');
         } else {
             await msg.reply(`Failed to connect: ${result.error}`);
         }
         return;
     }
 
-    const result = await sendToRoblox('DispatcherMessage', {
-        callId,
-        text,
-        dispatcher: msg.author.username,
-        threadId: msg.channel.id,
-    }, correlationId);
+    const result = await sendToRoblox(
+        'DispatcherMessage',
+        {
+            callId,
+            text,
+            dispatcher: msg.author.username,
+            threadId: msg.channel.id,
+        },
+        correlationId
+    );
 
     if (result.success) {
         threads.recordMessage(msg.channel.id);
@@ -760,11 +784,11 @@ async function handleCommand(msg, content) {
         const stats = threads.getStats();
         await msg.reply(
             `**Bot Status**\n` +
-            `Active Calls: ${stats.active}\n` +
-            `Answered: ${stats.answered}\n` +
-            `Waiting: ${stats.waiting}\n` +
-            `Circuit: ${stats.circuit.state}\n` +
-            `Processed: ${stats.processedCalls}`
+                `Active Calls: ${stats.active}\n` +
+                `Answered: ${stats.answered}\n` +
+                `Waiting: ${stats.waiting}\n` +
+                `Circuit: ${stats.circuit.state}\n` +
+                `Processed: ${stats.processedCalls}`
         );
         return;
     }
@@ -774,10 +798,10 @@ async function handleCommand(msg, content) {
         const healthy = stats.circuit.state === 'CLOSED';
         await msg.reply(
             `**System Health**\n` +
-            `Status: ${healthy ? '✅ Healthy' : '⚠️ Degraded'}\n` +
-            `Uptime: ${Math.floor(process.uptime())}s\n` +
-            `Circuit: ${stats.circuit.state}\n` +
-            `In-flight: ${inFlightRequests}`
+                `Status: ${healthy ? '✅ Healthy' : '⚠️ Degraded'}\n` +
+                `Uptime: ${Math.floor(process.uptime())}s\n` +
+                `Circuit: ${stats.circuit.state}\n` +
+                `In-flight: ${inFlightRequests}`
         );
         return;
     }
@@ -785,12 +809,12 @@ async function handleCommand(msg, content) {
     if (RE.cmd.help.test(content)) {
         await msg.reply(
             '**Commands**\n' +
-            '`!status` - Bot status\n' +
-            '`!health` - System health\n' +
-            '`!hangup` - End call (in thread)\n' +
-            '`!answer <id>` - Answer manually\n' +
-            '`!d <id> <msg>` - Send message\n' +
-            '`!hangup <id>` - End specific call'
+                '`!status` - Bot status\n' +
+                '`!health` - System health\n' +
+                '`!hangup` - End call (in thread)\n' +
+                '`!answer <id>` - Answer manually\n' +
+                '`!d <id> <msg>` - Send message\n' +
+                '`!hangup <id>` - End specific call'
         );
         return;
     }
@@ -802,11 +826,15 @@ async function handleCommand(msg, content) {
             return;
         }
         const correlationId = generateCorrelationId(match[1]);
-        const result = await sendToRoblox('DispatcherAction', {
-            callId: match[1],
-            action: 'answer',
-            dispatcher: msg.author.username
-        }, correlationId);
+        const result = await sendToRoblox(
+            'DispatcherAction',
+            {
+                callId: match[1],
+                action: 'answer',
+                dispatcher: msg.author.username,
+            },
+            correlationId
+        );
         await msg.reply(result.success ? '📞 Answer sent.' : `Failed: ${result.error}`);
         return;
     }
@@ -818,11 +846,15 @@ async function handleCommand(msg, content) {
             return;
         }
         const correlationId = generateCorrelationId(match[1]);
-        const result = await sendToRoblox('DispatcherMessage', {
-            callId: match[1],
-            text: sanitize(match[2]),
-            dispatcher: msg.author.username
-        }, correlationId);
+        const result = await sendToRoblox(
+            'DispatcherMessage',
+            {
+                callId: match[1],
+                text: sanitize(match[2]),
+                dispatcher: msg.author.username,
+            },
+            correlationId
+        );
         await msg.reply(result.success ? '✅ Sent.' : `Failed: ${result.error}`);
         return;
     }
@@ -834,11 +866,15 @@ async function handleCommand(msg, content) {
             return;
         }
         const correlationId = generateCorrelationId(match[1]);
-        const result = await sendToRoblox('DispatcherAction', {
-            callId: match[1],
-            action: 'hangup',
-            dispatcher: msg.author.username
-        }, correlationId);
+        const result = await sendToRoblox(
+            'DispatcherAction',
+            {
+                callId: match[1],
+                action: 'hangup',
+                dispatcher: msg.author.username,
+            },
+            correlationId
+        );
         await msg.reply(result.success ? '📵 Call ended.' : `Failed: ${result.error}`);
     }
 }
@@ -851,7 +887,7 @@ app.get('/', (req, res) => {
         status: 'online',
         uptime: Math.floor(process.uptime()),
         inFlight: inFlightRequests,
-        ...threads.getStats()
+        ...threads.getStats(),
     });
 });
 
