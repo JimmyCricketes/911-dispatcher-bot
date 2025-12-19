@@ -1,232 +1,819 @@
-// 911 DISPATCHER BOT - THREAD VERSION
-// Host on Railway.app or Render
+/**
+ * 911 Dispatcher Bot v3.2 (Fixed)
+ * Discord <-> Roblox emergency call bridge
+ */
+
+'use strict';
 
 const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
 const express = require('express');
+const https = require('https');
 
-// Simple web server to keep the bot alive
-express().get('/', (req, res) => res.send('Bot Online')).listen(3000);
+// Environment validation
+const REQUIRED_ENV = ['DISCORD_TOKEN', 'UNIVERSE_ID', 'ROBLOX_API_KEY', 'CHANNEL_911', 'CHANNEL_311', 'DISPATCHER_PING'];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]?.trim());
+if (missing.length) { console.error(`Missing env vars: ${missing.join(', ')}`); process.exit(1); }
 
-const client = new Client({
-    intents: [
-        // **FIXED: Removed space in GatewayIntentBits. Guilds**
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
-});
+// Configuration
+const CFG = {
+    channels: { '911': process.env.CHANNEL_911, '311': process.env.CHANNEL_311 },
+    dispatcher: process.env.DISPATCHER_PING,
+    roblox: {
+        universeId: process.env.UNIVERSE_ID,
+        apiKey: process.env.ROBLOX_API_KEY,
+        host: 'apis.roblox.com',
+        path: '/messaging-service/v1',
+        timeoutMs: 10000,
+    },
+    rate: { perSec: 5, retries: 3, baseDelayMs: 1000, maxDelayMs: 30000 },
+    circuit: { threshold: 5, resetMs: 30000 },
+    threads: { max: 100, archiveMins: 60, staleMs: 1800000, cleanupMs: 300000 },
+    limits: { msgLength: 500, callIdMax: 50, threadNameMax: 100 },
+    port: parseInt(process.env.PORT, 10) || 3000,
+    shutdownGraceMs: 5000,
+    cacheTtlMs: 300000,
+};
 
-// Track active call threads: { threadId: { callId, answered } }
-const activeThreads = new Map();
+// Compiled patterns
+const RE = {
+    callId: /^[A-Za-z0-9_-]{1,50}$/,
+    extract: [/Call ID:\s*([A-Za-z0-9_-]+)/i, /ID:\s*([A-Za-z0-9_-]+)/i],
+    cmd: {
+        hangup: /^!(?:hangup|end)$/i,
+        hangupId: /^!(?:hangup|end)\s+(\S+)$/i,
+        answer: /^!answer\s+(\S+)$/i,
+        dispatch: /^!d\s+(\S+)\s+(.+)$/is,
+        status: /^!status$/i,
+        help: /^!help$/i,
+    },
+};
 
-// Helper: Send action to Roblox
-async function sendToRoblox(topic, data) {
-    try {
-        const res = await fetch(
-            `https://apis.roblox.com/messaging-service/v1/universes/${process.env.UNIVERSE_ID}/topics/${topic}`,
-            {
-                method: 'POST',
-                headers: {
-                    'x-api-key': process.env.ROBLOX_API_KEY,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ message: JSON.stringify(data) })
-            }
-        );
-        return res.ok;
-    } catch (e) {
-        console.error(`[Roblox API Error] ${topic}:`, e);
-        return false;
+// Logging
+const LOG_LEVEL = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
+const logLevel = LOG_LEVEL[process.env.LOG_LEVEL?.toUpperCase()] ?? LOG_LEVEL.INFO;
+
+const log = {
+    fmt: (lvl, msg, meta) => `[${new Date().toISOString()}] [${lvl}] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`,
+    debug: (msg, meta) => logLevel <= LOG_LEVEL.DEBUG && console.log(log.fmt('DEBUG', msg, meta)),
+    info: (msg, meta) => logLevel <= LOG_LEVEL.INFO && console.log(log.fmt('INFO', msg, meta)),
+    warn: (msg, meta) => logLevel <= LOG_LEVEL.WARN && console.warn(log.fmt('WARN', msg, meta)),
+    error: (msg, meta) => console.error(log.fmt('ERROR', msg, meta)),
+};
+
+// Utilities
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const sanitize = text => (text || '').substring(0, CFG.limits.msgLength).replace(/[\x00-\x1F\x7F]/g, '').trim();
+const validCallId = id => typeof id === 'string' && RE.callId.test(id);
+
+// Rate Limiter
+class RateLimiter {
+    constructor(perSec) {
+        this.tokens = perSec;
+        this.max = perSec;
+        this.last = Date.now();
+    }
+
+    async acquire() {
+        while (true) {
+            const now = Date.now();
+            this.tokens = Math.min(this.max, this.tokens + ((now - this.last) / 1000) * this.max);
+            this.last = now;
+            if (this.tokens >= 1) { this.tokens--; return; }
+            await sleep(Math.ceil(((1 - this.tokens) / this.max) * 1000));
+        }
     }
 }
 
-// Monitor for new 911 call embeds and create threads
-client.on('messageCreate', async (msg) => {
-    if (!msg.author.bot || !msg.embeds || msg.embeds.length === 0) return;
+// Circuit Breaker
+class CircuitBreaker {
+    constructor(threshold, resetMs) {
+        this.threshold = threshold;
+        this.resetMs = resetMs;
+        this.failures = 0;
+        this.lastFail = null;
+        this.state = 'CLOSED';
+    }
 
-    const embed = msg.embeds[0];
+    canRequest() {
+        if (this.state === 'CLOSED') return true;
+        if (this.state === 'OPEN' && Date.now() - this.lastFail >= this.resetMs) {
+            this.state = 'HALF_OPEN';
+            return true;
+        }
+        return this.state === 'HALF_OPEN';
+    }
 
-    if (embed.title && embed.title.includes('EMERGENCY CALL - 911')) {
-        // **FIXED: Removed space in find**
-        const statusField = embed.fields?.find(f => f.name && f.name.includes('Status'));
+    success() {
+        this.failures = 0;
+        this.state = 'CLOSED';
+    }
 
-        if (statusField && statusField.value && statusField.value.includes('RINGING')) {
-            let callId = 'unknown';
-            if (embed.description) {
-                const match = embed.description.match(/Call ID:\s*(\S+)/);
-                if (match) callId = match[1];
-            }
+    fail() {
+        this.failures++;
+        this.lastFail = Date.now();
+        if (this.state === 'HALF_OPEN' || this.failures >= this.threshold) {
+            this.state = 'OPEN';
+            log.warn('Circuit breaker opened', { failures: this.failures });
+        }
+    }
 
-            let callbackNumber = 'Unknown';
-            const callbackField = embed.fields?.find(f => f.name && f.name.includes('Callback'));
-            if (callbackField && callbackField.value) {
-                callbackNumber = callbackField.value;
-            }
+    getState() {
+        return { state: this.state, failures: this.failures };
+    }
+}
 
-            try {
-                const thread = await msg.startThread({
-                    name: `911 Call - ${callId}`,
-                    autoArchiveDuration: 60
-                });
+// Instantiate circuit breaker BEFORE ThreadManager
+const circuit = new CircuitBreaker(CFG.circuit.threshold, CFG.circuit.resetMs);
 
-                activeThreads.set(thread.id, {
-                    callId: callId,
-                    answered: false
-                });
+// LRU Node
+class LRUNode {
+    constructor(key, value) {
+        this.key = key;
+        this.value = value;
+        this.prev = null;
+        this.next = null;
+    }
+}
 
-                await thread.send(
-                    `<@769664717614088193>\n` +
-                    `**INCOMING 911 CALL**\n` +
-                    `Send a message to answer and respond.\n` +
-                    `\`!hangup\` to end call. `
-                );
+// Thread Manager with true LRU
+class ThreadManager {
+    #map = new Map();
+    #callIndex = new Map();
+    #head = null;
+    #tail = null;
+    #timer = null;
+    #stats = { active: 0, answered: 0, created: 0, closed: 0 };
 
-            } catch (e) {
-                // **FIXED: Removed space in console.error and msg.channel.send**
-                console.error('[Thread Error]:', e);
-                await msg.channel.send(`<@769664717614088193> INCOMING 911 CALL - Use !answer ${callId} to connect`);
+    constructor() {
+        this.#startCleanup();
+    }
+
+    #moveToHead(node) {
+        if (node === this.#head) return;
+
+        // Remove from current position
+        if (node.prev) node.prev.next = node.next;
+        else this.#head = node.next;
+
+        if (node.next) node.next.prev = node.prev;
+        else this.#tail = node.prev;
+
+        // Clear node's pointers before reinserting
+        node.prev = null;
+        node.next = null;
+
+        // Add to head
+        if (this.#head) {
+            this.#head.prev = node;
+            node.next = this.#head;
+        }
+        this.#head = node;
+        if (!this.#tail) this.#tail = node;
+    }
+
+    #addToHead(node) {
+        node.prev = null;
+        node.next = this.#head;
+        if (this.#head) this.#head.prev = node;
+        this.#head = node;
+        if (!this.#tail) this.#tail = node;
+    }
+
+    #removeTail() {
+        if (!this.#tail) return null;
+        const node = this.#tail;
+
+        if (node.prev) {
+            this.#tail = node.prev;
+            this.#tail.next = null;
+        } else {
+            this.#head = null;
+            this.#tail = null;
+        }
+
+        node.prev = null;
+        node.next = null;
+
+        return node;
+    }
+
+    #removeNode(node) {
+        if (node.prev) node.prev.next = node.next;
+        else this.#head = node.next;
+
+        if (node.next) node.next.prev = node.prev;
+        else this.#tail = node.prev;
+
+        node.prev = null;
+        node.next = null;
+    }
+
+    create(threadId, callId, callType) {
+        if (!validCallId(callId)) return null;
+
+        if (this.#map.size >= CFG.threads.max) {
+            const evicted = this.#removeTail();
+            if (evicted) {
+                this.#map.delete(evicted.key);
+                this.#callIndex.delete(evicted.value.callId);
+                this.#stats.active--;
+                if (evicted.value.answered) this.#stats.answered--;
+                this.#stats.closed++;
+                log.info('Thread evicted (LRU)', { threadId: evicted.key, callId: evicted.value.callId });
             }
         }
+
+        const existing = this.#callIndex.get(callId);
+        if (existing && this.#map.has(existing)) {
+            const node = this.#map.get(existing);
+            this.#moveToHead(node);
+            return node.value;
+        }
+
+        const data = { threadId, callId, callType, answered: false, lastActivity: Date.now(), messages: 0 };
+        const node = new LRUNode(threadId, data);
+
+        this.#map.set(threadId, node);
+        this.#callIndex.set(callId, threadId);
+        this.#addToHead(node);
+
+        this.#stats.active++;
+        this.#stats.created++;
+        log.info('Thread created', { threadId, callId, callType });
+        return data;
+    }
+
+    get(threadId) {
+        const node = this.#map.get(threadId);
+        if (!node) return undefined;
+        node.value.lastActivity = Date.now();
+        this.#moveToHead(node);
+        return node.value;
+    }
+
+    getByCallId(callId) {
+        const threadId = this.#callIndex.get(callId);
+        return threadId ? this.get(threadId) : undefined;
+    }
+
+    markAnswered(threadId) {
+        const node = this.#map.get(threadId);
+        if (!node) return false;
+        if (!node.value.answered) {
+            node.value.answered = true;
+            this.#stats.answered++;
+        }
+        node.value.lastActivity = Date.now();
+        this.#moveToHead(node);
+        return true;
+    }
+
+    recordMessage(threadId) {
+        const node = this.#map.get(threadId);
+        if (node) {
+            node.value.messages++;
+            node.value.lastActivity = Date.now();
+            this.#moveToHead(node);
+        }
+    }
+
+    close(threadId, reason = 'closed') {
+        const node = this.#map.get(threadId);
+        if (!node) return null;
+
+        this.#removeNode(node);
+        this.#map.delete(threadId);
+        this.#callIndex.delete(node.value.callId);
+
+        this.#stats.active--;
+        if (node.value.answered) this.#stats.answered--;
+        this.#stats.closed++;
+
+        log.info('Thread closed', { threadId, callId: node.value.callId, reason });
+        return node.value;
+    }
+
+    getStats() {
+        return {
+            active: this.#stats.active,
+            answered: this.#stats.answered,
+            waiting: this.#stats.active - this.#stats.answered,
+            circuit: circuit.getState(),
+        };
+    }
+
+    getStaleThreads() {
+        const now = Date.now();
+        const stale = [];
+        let current = this.#tail;
+
+        while (current) {
+            if (now - current.value.lastActivity > CFG.threads.staleMs) {
+                stale.push({ threadId: current.key, ...current.value });
+            }
+            current = current.prev;
+        }
+
+        return stale;
+    }
+
+    async #cleanup() {
+        const stale = this.getStaleThreads();
+
+        for (const data of stale) {
+            if (data.answered) {
+                await sendToRoblox('DispatcherAction', {
+                    callId: data.callId,
+                    action: 'hangup',
+                    dispatcher: 'System'
+                });
+            }
+            this.close(data.threadId, 'stale');
+
+            try {
+                const thread = await client.channels.fetch(data.threadId).catch(() => null);
+                if (thread?.isThread?.() && !thread.archived) {
+                    await thread.setArchived(true);
+                }
+            } catch (err) {
+                log.warn('Failed to archive stale thread', { threadId: data.threadId, error: err.message });
+            }
+        }
+
+        if (stale.length) {
+            log.info('Cleanup complete', { removed: stale.length, remaining: this.#stats.active });
+        }
+    }
+
+    #startCleanup() {
+        this.#timer = setInterval(() => {
+            this.#cleanup().catch(err => {
+                log.warn('Cleanup error', { error: err.message });
+            });
+        }, CFG.threads.cleanupMs);
+        this.#timer.unref();
+    }
+
+    destroy() {
+        if (this.#timer) {
+            clearInterval(this.#timer);
+            this.#timer = null;
+        }
+    }
+}
+
+// Channel Cache with proper TTL handling
+class ChannelCache {
+    #cache = new Map();
+
+    async get(channelId) {
+        const cached = this.#cache.get(channelId);
+        const now = Date.now();
+
+        // Return cached if valid and not expired
+        if (cached && now - cached.time < CFG.cacheTtlMs) {
+            return cached.channel;
+        }
+
+        // Expired or not cached - fetch fresh
+        const channel = await client.channels.fetch(channelId).catch(() => null);
+
+        if (channel) {
+            this.#cache.set(channelId, { channel, time: now });
+            return channel;
+        }
+
+        // Fetch failed - delete stale entry and return null
+        this.#cache.delete(channelId);
+        return null;
+    }
+
+    invalidate(channelId) {
+        this.#cache.delete(channelId);
+    }
+
+    clear() {
+        this.#cache.clear();
+    }
+}
+
+// Roblox API
+const agent = new https.Agent({ keepAlive: true, maxSockets: 10 });
+const limiter = new RateLimiter(CFG.rate.perSec);
+
+let inFlightRequests = 0;
+
+async function sendToRoblox(topic, data) {
+    if (!circuit.canRequest()) {
+        return { success: false, error: 'Circuit open' };
+    }
+
+    const payload = { ...data };
+    if (payload.text) payload.text = sanitize(payload.text);
+    if (payload.message) payload.message = sanitize(payload.message);
+
+    inFlightRequests++;
+
+    try {
+        for (let attempt = 1; attempt <= CFG.rate.retries; attempt++) {
+            try {
+                await limiter.acquire();
+                const result = await robloxRequest(topic, payload);
+
+                if (result.status >= 200 && result.status < 300) {
+                    circuit.success();
+                    return { success: true };
+                }
+
+                if (result.status === 429) {
+                    const retryHeader = result.headers['retry-after'];
+                    const retry = parseInt(retryHeader, 10);
+                    const waitMs = (!isNaN(retry) && retry > 0) ? retry * 1000 : CFG.rate.baseDelayMs;
+                    await sleep(Math.min(waitMs, CFG.rate.maxDelayMs));
+                    continue;
+                }
+
+                if (result.status >= 500) {
+                    throw new Error(`Server error: ${result.status}`);
+                }
+
+                circuit.fail();
+                return { success: false, error: `HTTP ${result.status}` };
+            } catch (err) {
+                log.warn('Roblox API failed', { topic, attempt, error: err.message });
+                if (attempt < CFG.rate.retries) {
+                    const delay = Math.min(
+                        CFG.rate.baseDelayMs * Math.pow(2, attempt - 1),
+                        CFG.rate.maxDelayMs
+                    );
+                    await sleep(delay);
+                }
+            }
+        }
+
+        circuit.fail();
+        return { success: false, error: 'Max retries exceeded' };
+    } finally {
+        inFlightRequests--;
+    }
+}
+
+function robloxRequest(topic, data) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify({ message: JSON.stringify(data) });
+        const req = https.request({
+            hostname: CFG.roblox.host,
+            path: `${CFG.roblox.path}/universes/${CFG.roblox.universeId}/topics/${topic}`,
+            method: 'POST',
+            agent,
+            headers: {
+                'x-api-key': CFG.roblox.apiKey,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+            },
+            timeout: CFG.roblox.timeoutMs,
+        }, res => {
+            let responseData = '';
+            res.on('data', chunk => responseData += chunk);
+            res.on('end', () => resolve({
+                status: res.statusCode,
+                headers: res.headers,
+                body: responseData
+            }));
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Timeout'));
+        });
+        req.write(body);
+        req.end();
+    });
+}
+
+// Embed parsing
+function parseEmbed(embed) {
+    if (!embed?.title) return null;
+
+    const callType = embed.title.includes('911') ? '911' : embed.title.includes('311') ? '311' : null;
+    if (!callType) return null;
+
+    let callId = null;
+    if (embed.description) {
+        for (const re of RE.extract) {
+            const match = embed.description.match(re);
+            if (match?.[1] && validCallId(match[1])) {
+                callId = match[1];
+                break;
+            }
+        }
+    }
+
+    let status = null, callback = 'Unknown';
+    for (const field of embed.fields || []) {
+        const name = field.name?.toLowerCase() || '';
+        if (name.includes('status')) status = field.value;
+        else if (name.includes('callback') || name.includes('number')) callback = field.value;
+    }
+
+    return { callType, callId, status, callback };
+}
+
+// Discord client
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ],
+});
+
+const threads = new ThreadManager();
+const channelCache = new ChannelCache();
+
+// Discord reconnection handling
+client.on('shardDisconnect', (event, shardId) => {
+    log.warn('Discord disconnected', { shardId, code: event?.code });
+});
+
+client.on('shardReconnecting', shardId => {
+    log.info('Discord reconnecting', { shardId });
+    channelCache.clear();
+});
+
+client.on('shardResume', shardId => {
+    log.info('Discord reconnected', { shardId });
+});
+
+client.on('shardError', (error, shardId) => {
+    log.error('Discord shard error', { shardId, error: error.message });
+});
+
+// Message handler
+client.on('messageCreate', async msg => {
+    if (!msg.author) return;
+
+    try {
+        if (msg.author.bot && msg.embeds?.length) {
+            await handleIncoming(msg);
+        } else if (!msg.author.bot && msg.content?.trim()) {
+            await handleUser(msg);
+        }
+    } catch (err) {
+        log.error('Handler error', { error: err.message, stack: err.stack });
     }
 });
 
-// Handle messages in threads
-client.on('messageCreate', async (msg) => {
-    if (msg.author.bot) return;
+async function handleIncoming(msg) {
+    const parsed = parseEmbed(msg.embeds[0]);
+    if (!parsed?.callType || !parsed.callId) return;
+    if (!parsed.status?.toUpperCase().includes('RINGING')) return;
 
-    // Check if in active call thread
-    // **FIXED: Removed space in ChannelType**
-    if (msg.channel.type === ChannelType.PublicThread || msg.channel.type === ChannelType.PrivateThread) {
-        const threadData = activeThreads.get(msg.channel.id);
+    const channelId = CFG.channels[parsed.callType];
+    if (!channelId) return;
 
-        if (threadData) {
-            const { callId, answered } = threadData;
+    try {
+        const channel = await channelCache.get(channelId);
+        if (!channel) throw new Error('Channel not found');
 
-            // Check for hangup command
-            if (msg.content.toLowerCase() === '!hangup' || msg.content.toLowerCase() === '!end') {
-                const success = await sendToRoblox('DispatcherAction', {
-                    callId: callId,
-                    action: 'hangup',
-                    dispatcher: msg.author.username,
-                    threadId: msg.channel.id
-                });
+        const routed = await channel.send({ embeds: msg.embeds });
+        const name = `${parsed.callType} Call - ${parsed.callId}`.substring(0, CFG.limits.threadNameMax);
 
-                if (success) {
-                    await msg.reply('Call ended.');
-                    activeThreads.delete(msg.channel.id);
+        let thread;
+        try {
+            thread = await routed.startThread({ name, autoArchiveDuration: CFG.threads.archiveMins });
+        } catch (threadErr) {
+            await routed.delete().catch(() => {});
+            throw threadErr;
+        }
 
-                    // Archive the thread
-                    try {
-                        await msg.channel.setArchived(true);
-                    } catch (e) {
-                        console.error('[Thread Archive Error]:', e);
-                    }
-                } else {
-                    // **FIXED: Removed space in msg.reply**
-                    await msg.reply('Failed to end call.');
-                }
-                return;
-            }
+        const threadData = threads.create(thread.id, parsed.callId, parsed.callType);
+        if (!threadData) {
+            await thread.delete().catch(() => {});
+            await routed.delete().catch(() => {});
+            return;
+        }
 
-            // If not answered yet, answer first WITH the message included
-            if (!answered) {
-                const success = await sendToRoblox('DispatcherAction', {
-                    // **FIXED: Removed space in callId value**
-                    callId: callId,
-                    // **FIXED: Removed space in action value**
-                    action: 'answer',
-                    dispatcher: msg.author.username,
-                    message: msg.content,
-                    threadId: msg.channel.id
-                });
+        const type = parsed.callType === '911' ? 'EMERGENCY' : 'NON-EMERGENCY';
+        await thread.send(
+            `<@${CFG.dispatcher}>\n` +
+            `**INCOMING ${parsed.callType} ${type} CALL**\n` +
+            `Callback: ${parsed.callback}\n` +
+            `Call ID: \`${parsed.callId}\`\n\n` +
+            `Send a message to answer.\n` +
+            `\`!hangup\` to end.`
+        );
 
-                if (success) {
-                    threadData.answered = true;
-                    activeThreads.set(msg.channel.id, threadData);
-                } else {
-                    // **FIXED: Removed space in msg.reply**
-                    await msg.reply('Failed to connect to call.');
-                }
-                return;
-            }
+        log.info('Thread created', { threadId: thread.id, callId: parsed.callId });
+    } catch (err) {
+        log.error('Thread creation failed', { error: err.message, callId: parsed.callId });
 
-            // Send message to caller (only for subsequent messages)
-            const success = await sendToRoblox('DispatcherMessage', {
-                callId: callId,
-                text: msg.content,
-                dispatcher: msg.author.username,
-                // **FIXED: Removed space in threadId value**
-                threadId: msg.channel.id
-            });
+        const channel = await channelCache.get(channelId);
+        if (channel) {
+            await channel.send(
+                `<@${CFG.dispatcher}> INCOMING ${parsed.callType} CALL\n` +
+                `Call ID: \`${parsed.callId}\`\n` +
+                `Use \`!answer ${parsed.callId}\` to connect.`
+            ).catch(() => {});
+        }
+    }
+}
 
-            // **FIXED: Removed space in conditional logic and msg.reply**
-            if (!success) {
-                await msg.reply('Failed');
-            }
+async function handleUser(msg) {
+    const content = msg.content.trim();
+    const isThread = msg.channel.type === ChannelType.PublicThread ||
+                     msg.channel.type === ChannelType.PrivateThread;
 
+    if (isThread) {
+        const data = threads.get(msg.channel.id);
+        if (data) {
+            await handleThread(msg, data, content);
             return;
         }
     }
 
-    // Legacy commands
-    if (msg.content === '!status') {
-        msg.reply('Bot online');
+    await handleCommand(msg, content);
+}
+
+async function handleThread(msg, data, content) {
+    const { callId, answered, callType } = data;
+
+    if (RE.cmd.hangup.test(content)) {
+        const result = await sendToRoblox('DispatcherAction', {
+            callId,
+            action: 'hangup',
+            dispatcher: msg.author.username,
+            threadId: msg.channel.id,
+        });
+
+        if (result.success) {
+            await msg.reply(`${callType} call ended.`);
+            threads.close(msg.channel.id, 'hangup');
+            await msg.channel.setArchived(true).catch(() => {});
+        } else {
+            await msg.reply(`Failed: ${result.error}`);
+        }
         return;
     }
 
-    // **FIXED: Removed space in startsWith**
-    if (msg.content.startsWith('!answer ')) {
-        // **FIXED: Removed space in conditional logic**
-        const callId = msg.content.slice(8).trim();
-        if (!callId) {
-            msg.reply('Usage: !answer <callId>');
+    const text = sanitize(content);
+    if (!text) return;
+
+    if (!answered) {
+        const result = await sendToRoblox('DispatcherAction', {
+            callId,
+            action: 'answer',
+            dispatcher: msg.author.username,
+            message: text,
+            threadId: msg.channel.id,
+        });
+
+        if (result.success) {
+            threads.markAnswered(msg.channel.id);
+            threads.recordMessage(msg.channel.id);
+        } else {
+            await msg.reply(`Failed to connect: ${result.error}`);
+        }
+        return;
+    }
+
+    const result = await sendToRoblox('DispatcherMessage', {
+        callId,
+        text,
+        dispatcher: msg.author.username,
+        threadId: msg.channel.id,
+    });
+
+    if (result.success) {
+        threads.recordMessage(msg.channel.id);
+    }
+}
+
+async function handleCommand(msg, content) {
+    if (RE.cmd.status.test(content)) {
+        const stats = threads.getStats();
+        await msg.reply(
+            `Bot Online\n` +
+            `Active: ${stats.active}\n` +
+            `Answered: ${stats.answered}\n` +
+            `Waiting: ${stats.waiting}\n` +
+            `Circuit: ${stats.circuit.state}`
+        );
+        return;
+    }
+
+    if (RE.cmd.help.test(content)) {
+        await msg.reply(
+            '**Commands**\n' +
+            '`!status` - Bot status\n' +
+            '`!hangup` - End call (in thread)\n' +
+            '`!answer <id>` - Answer manually\n' +
+            '`!d <id> <msg>` - Send message\n' +
+            '`!hangup <id>` - End specific call'
+        );
+        return;
+    }
+
+    let match = content.match(RE.cmd.answer);
+    if (match) {
+        if (!validCallId(match[1])) {
+            await msg.reply('Invalid call ID.');
             return;
         }
-        const success = await sendToRoblox('DispatcherAction', {
-            callId: callId,
+        const result = await sendToRoblox('DispatcherAction', {
+            callId: match[1],
             action: 'answer',
             dispatcher: msg.author.username
         });
-        msg.reply(success ? 'Sent' : 'Failed');
+        await msg.reply(result.success ? 'Answer sent.' : `Failed: ${result.error}`);
         return;
     }
 
-    if (msg.content.startsWith('!d ')) {
-        const args = msg.content.slice(3).trim().split(' ');
-        // **FIXED: Removed space in shift**
-        const callId = args.shift();
-        const text = args.join(' ');
-        if (!callId || !text) {
-            msg.reply('Usage: !d <callId> <message>');
+    match = content.match(RE.cmd.dispatch);
+    if (match) {
+        if (!validCallId(match[1])) {
+            await msg.reply('Invalid call ID.');
             return;
         }
-        const success = await sendToRoblox('DispatcherMessage', {
-            callId: callId,
-            // **FIXED: Removed space in text value**
-            text: text,
-            // **FIXED: Removed space in dispatcher value**
+        const result = await sendToRoblox('DispatcherMessage', {
+            callId: match[1],
+            text: sanitize(match[2]),
             dispatcher: msg.author.username
         });
-        msg.reply(success ? 'Sent' : 'Failed');
+        await msg.reply(result.success ? 'Sent.' : `Failed: ${result.error}`);
         return;
     }
 
-    if (msg.content.startsWith('!hangup ') || msg.content.startsWith('!end ')) {
-        const callId = msg.content.split(' ')[1]?.trim();
-        if (!callId) {
-            msg.reply('Usage: !hangup <callId>');
+    match = content.match(RE.cmd.hangupId);
+    if (match) {
+        if (!validCallId(match[1])) {
+            await msg.reply('Invalid call ID.');
             return;
         }
-        const success = await sendToRoblox('DispatcherAction', {
-            callId: callId,
+        const result = await sendToRoblox('DispatcherAction', {
+            callId: match[1],
             action: 'hangup',
             dispatcher: msg.author.username
         });
-        msg.reply(success ? 'Call ended.' : 'Failed');
-        return;
+        await msg.reply(result.success ? 'Call ended.' : `Failed: ${result.error}`);
     }
+}
+
+// Health server
+const app = express();
+
+app.get('/', (req, res) => {
+    res.json({
+        status: 'online',
+        uptime: Math.floor(process.uptime()),
+        inFlight: inFlightRequests,
+        ...threads.getStats()
+    });
 });
 
-client.once('ready', () => console.log('Bot ready!'));
-// **FIXED: Removed space in environment variable access and console.log**
-client.login(process.env.DISCORD_TOKEN);
+app.get('/health', (req, res) => res.send('OK'));
+
+const server = app.listen(CFG.port, () => log.info(`Server on port ${CFG.port}`));
+
+// Graceful shutdown
+let stopping = false;
+
+async function shutdown(signal) {
+    if (stopping) return;
+    stopping = true;
+    log.info(`${signal} received, shutting down`);
+
+    server.close();
+
+    const deadline = Date.now() + CFG.shutdownGraceMs;
+    while (inFlightRequests > 0 && Date.now() < deadline) {
+        log.info(`Waiting for ${inFlightRequests} in-flight requests`);
+        await sleep(500);
+    }
+
+    if (inFlightRequests > 0) {
+        log.warn(`Shutdown timeout, ${inFlightRequests} requests abandoned`);
+    }
+
+    threads.destroy();
+    client.destroy();
+    agent.destroy();
+
+    await sleep(500);
+    process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('unhandledRejection', reason => {
+    log.error('Unhandled rejection', { error: reason?.message || String(reason) });
+});
+
+// Start
+client.once('ready', () => log.info(`Ready as ${client.user.tag}`));
+client.on('error', err => log.error('Client error', { error: err.message }));
+
+client.login(process.env.DISCORD_TOKEN).catch(err => {
+    log.error('Login failed', { error: err.message });
+    process.exit(1);
+});
