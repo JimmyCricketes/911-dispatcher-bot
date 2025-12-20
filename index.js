@@ -681,7 +681,7 @@ async function handleIncoming(msg) {
         const type = parsed.callType === '911' ? 'EMERGENCY' : 'NON-EMERGENCY';
         await discordLimiter.acquire();
         await thread.send(
-            `<@${CFG.dispatcher}>\n` +
+            `<@&${CFG.dispatcher}>\n` +
                 `**INCOMING ${parsed.callType} ${type} CALL**\n\n` +
                 `Send a message to answer.\n` +
                 '`!hangup` to end.'
@@ -754,7 +754,7 @@ async function handleThread(msg, data, content) {
         if (result.success) {
             threads.markAnswered(msg.channel.id);
             threads.recordMessage(msg.channel.id);
-            await msg.reply('📞 Connected! Your message was sent to the caller.');
+            await msg.reply('Connected: Message sent to caller.');
         } else {
             await msg.reply(`Failed to connect: ${result.error}`);
         }
@@ -798,7 +798,7 @@ async function handleCommand(msg, content) {
         const healthy = stats.circuit.state === 'CLOSED';
         await msg.reply(
             `**System Health**\n` +
-                `Status: ${healthy ? '✅ Healthy' : '⚠️ Degraded'}\n` +
+                `Status: ${healthy ? 'Healthy' : 'Degraded'}\n` +
                 `Uptime: ${Math.floor(process.uptime())}s\n` +
                 `Circuit: ${stats.circuit.state}\n` +
                 `In-flight: ${inFlightRequests}`
@@ -835,7 +835,7 @@ async function handleCommand(msg, content) {
             },
             correlationId
         );
-        await msg.reply(result.success ? '📞 Answer sent.' : `Failed: ${result.error}`);
+        await msg.reply(result.success ? 'Answer sent.' : `Failed: ${result.error}`);
         return;
     }
 
@@ -855,7 +855,7 @@ async function handleCommand(msg, content) {
             },
             correlationId
         );
-        await msg.reply(result.success ? '✅ Sent.' : `Failed: ${result.error}`);
+        await msg.reply(result.success ? 'Sent.' : `Failed: ${result.error}`);
         return;
     }
 
@@ -875,7 +875,7 @@ async function handleCommand(msg, content) {
             },
             correlationId
         );
-        await msg.reply(result.success ? '📵 Call ended.' : `Failed: ${result.error}`);
+        await msg.reply(result.success ? 'Call ended.' : `Failed: ${result.error}`);
     }
 }
 
