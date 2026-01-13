@@ -408,15 +408,23 @@ async function handleWhitelistCommand(msg) {
         }
         
         const whitelist = await getWhitelist();
+        const existing = whitelist[userId]?.guns || [];
+        
+        // Check for duplicates
+        const newGuns = guns.filter(g => !existing.includes(g));
+        if (newGuns.length === 0) {
+            await msg.reply(`User \`${userId}\` already has: ${guns.join(', ')}`);
+            markProcessed(msg.id);
+            return true;
+        }
         
         if (whitelist[userId]) {
-            const existing = whitelist[userId].guns || [];
-            whitelist[userId].guns = [...new Set([...existing, ...guns])];
+            whitelist[userId].guns = [...existing, ...newGuns];
             whitelist[userId].updatedBy = msg.author.username;
             whitelist[userId].updatedAt = new Date().toISOString();
         } else {
             whitelist[userId] = {
-                guns,
+                guns: newGuns,
                 name: null,
                 addedBy: msg.author.username,
                 addedAt: new Date().toISOString(),
@@ -424,7 +432,7 @@ async function handleWhitelistCommand(msg) {
         }
         
         if (await saveWhitelist(whitelist)) {
-            await msg.reply(`Added \`${userId}\` with: ${guns.join(', ')}\n*Live in-game now!*`);
+            await msg.reply(`Operation successful.`);
         } else {
             await msg.reply(`Failed to update DataStore`);
         }
