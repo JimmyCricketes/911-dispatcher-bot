@@ -11,6 +11,7 @@
 'use strict';
 
 const https = require('https');
+const crypto = require('crypto');
 
 const ROBLOX_UNIVERSE_ID = process.env.ROBLOX_UNIVERSE_ID || process.env.UNIVERSE_ID;
 const ROBLOX_DATASTORE_KEY = process.env.ROBLOX_DATASTORE_KEY;
@@ -124,20 +125,24 @@ function datastoreRequest(method, entryKey, data = null) {
         const basePath = `/datastores/v1/universes/${ROBLOX_UNIVERSE_ID}/standard-datastores/datastore/entries/entry`;
         const query = `?datastoreName=${encodeURIComponent(DATASTORE_NAME)}&entryKey=${encodeURIComponent(entryKey)}`;
         
+        const headers = {
+            'x-api-key': ROBLOX_DATASTORE_KEY,
+        };
+
+        let body = null;
+        if (data) {
+            body = JSON.stringify(data);
+            headers['Content-Type'] = 'application/json';
+            headers['Content-Length'] = Buffer.byteLength(body);
+            headers['content-md5'] = crypto.createHash('md5').update(body).digest('base64');
+        }
+
         const options = {
             hostname: 'apis.roblox.com',
             path: basePath + query,
             method: method,
-            headers: {
-                'x-api-key': ROBLOX_DATASTORE_KEY,
-                'Content-Type': 'application/json',
-            },
+            headers: headers,
         };
-
-        if (data) {
-            const body = JSON.stringify(data);
-            options.headers['Content-Length'] = Buffer.byteLength(body);
-        }
 
         const req = https.request(options, res => {
             let responseData = '';
@@ -158,7 +163,7 @@ function datastoreRequest(method, entryKey, data = null) {
         });
 
         req.on('error', reject);
-        if (data) req.write(JSON.stringify(data));
+        if (body) req.write(body);
         req.end();
     });
 }
@@ -291,12 +296,12 @@ async function handleWhitelistCommand(msg) {
         
         const lines = [];
         for (const [id, data] of allUsers) {
-            const tag = data.source === 'BOTH' ? '' : data.source === 'RUNTIME' ? '' : '';
+            const tag = data.source === 'BOTH' ? '[BOTH]' : data.source === 'RUNTIME' ? '[RUNTIME]' : '[STUDIO]';
             lines.push(`${tag} \`${id}\` (${data.name}): ${data.guns.join(', ')}`);
         }
         
         let response = `**All Whitelisted Users (${allUsers.size} total)**\n`;
-        response += `= Studio |  = Runtime | = Both\n\n`;
+        response += `[STUDIO] = Studio | [RUNTIME] = Runtime | [BOTH] = Both\n\n`;
         
         if (lines.join('\n').length > 1800) {
             response += lines.slice(0, 40).join('\n') + `\n... and ${lines.length - 40} more`;
