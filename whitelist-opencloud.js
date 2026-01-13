@@ -249,18 +249,22 @@ function formatList(whitelist) {
  * Handle whitelist commands
  */
 async function handleWhitelistCommand(msg) {
-    if (msg.channel.id !== WHITELIST_CHANNEL_ID) return false;
-    if (msg.author.bot) return false;
-    
-    // Prevent duplicate processing
-    if (processedMessages.has(msg.id)) return true;
+    // Prevent duplicate processing FIRST
+    if (processedMessages.has(msg.id)) {
+        console.log('[Whitelist] Duplicate message blocked:', msg.id);
+        return true;
+    }
     processedMessages.add(msg.id);
     if (processedMessages.size > MAX_PROCESSED) {
         const first = processedMessages.values().next().value;
         processedMessages.delete(first);
     }
     
+    if (msg.channel.id !== WHITELIST_CHANNEL_ID) return false;
+    if (msg.author.bot) return false;
+    
     const content = msg.content.trim();
+    if (!content.startsWith('!whitelist')) return false;
     let match;
     
     // Help
@@ -393,7 +397,7 @@ async function handleWhitelistCommand(msg) {
         }
         
         if (await saveWhitelist(whitelist)) {
-            await msg.reply(`Added \`${userId}\` with: ${guns.join(', ')}\n*Applied successfully*`);
+            await msg.reply(`Added \`${userId}\` with: ${guns.join(', ')}\n*Live in-game now!*`);
         } else {
             await msg.reply(`Failed to update DataStore`);
         }
