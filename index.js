@@ -1,668 +1,470 @@
 /**
- * 911 Dispatcher Bot v3.5 (Optimized)
- * Discord <-> Roblox emergency call bridge
+ * Gun Whitelist Handler - Open Cloud Version
+ * Updates Roblox DataStore directly via Open Cloud API
+ * 
+ * Required env vars:
+ * - WHITELIST_CHANNEL_ID: Channel where mods can manage whitelist
+ * - ROBLOX_UNIVERSE_ID: Your game's Universe ID
+ * - ROBLOX_DATASTORE_KEY: Open Cloud API key with DataStore access
  */
 
 'use strict';
 
-const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
-const express = require('express');
 const https = require('https');
 const crypto = require('crypto');
 
-// Whitelist system
-const { handleWhitelistCommand, initWhitelist } = require('./whitelist-opencloud');
+const ROBLOX_UNIVERSE_ID = process.env.ROBLOX_UNIVERSE_ID || process.env.UNIVERSE_ID;
+const ROBLOX_DATASTORE_KEY = process.env.ROBLOX_DATASTORE_KEY || process.env.ROBLOX_API_KEY;
+const WHITELIST_CHANNEL_ID = process.env.WHITELIST_CHANNEL_ID;
 
-// Environment validation
-const REQUIRED_ENV = ['DISCORD_TOKEN', 'UNIVERSE_ID', 'ROBLOX_API_KEY', 'DISPATCHER_PING'];
-const missing = REQUIRED_ENV.filter(k => !process.env[k]?.trim());
-if (missing.length) {
-    console.error(`Missing env vars: ${missing.join(', ')}`);
-    process.exit(1);
-}
+const DATASTORE_NAME = 'GunWhitelist';
+const ENTRY_KEY = 'whitelist_v1';
 
-// Configuration
-const CFG = {
-    dispatcher: process.env.DISPATCHER_PING,
-    adminNotify: process.env.ADMIN_NOTIFY || process.env.DISPATCHER_PING,
-    roblox: {
-        universeId: process.env.UNIVERSE_ID,
-        apiKey: process.env.ROBLOX_API_KEY,
-        host: 'apis.roblox.com',
-        path: '/messaging-service/v1',
-        timeoutMs: 10000,
-    },
-    rate: { perSec: 5, retries: 3, baseDelayMs: 1000, maxDelayMs: 30000 },
-    discord: { perSec: 10 },
-    circuit: { threshold: 5, resetMs: 30000 },
-    threads: { max: 100, archiveMins: 60, staleMs: 1800000, cleanupMs: 300000 },
-    limits: { msgLength: 500, callIdMax: 50, threadNameMax: 100, usernameMax: 20 },
-    processedCalls: { maxSize: 10000, evictCount: 1000, ttlMs: 3600000 },
-    port: parseInt(process.env.PORT, 10) || 3000,
-    shutdownGraceMs: 5000,
-    cacheTtlMs: 300000,
+// Available guns
+const VALID_GUNS = [
+    'M1911',
+    '.38 SNUBNOSE',
+    'M1928 TOMMY GUN',
+    'M1897 Shotgun'
+];
+
+// Command patterns
+const CMD = {
+    add: /^!whitelist\s+add\s+(\d+)\s+(.+)$/i,
+    remove: /^!whitelist\s+remove\s+(\d+)(?:\s+(.+))?$/i,
+    list: /^!whitelist\s+list$/i,
+    listAll: /^!whitelist\s+all$/i,
+    help: /^!whitelist\s+help$/i,
+    lookup: /^!whitelist\s+lookup\s+(\d+)$/i,
+    sync: /^!whitelist\s+sync$/i,
 };
 
-// Compiled patterns
-const RE = {
-    callId: /^[A-Za-z0-9_-]{1,50}$/,
-    extract: [/Call\s*ID[:\s]+([A-Za-z0-9_-]+)/i, /ID[:\s]+([A-Za-z0-9_-]+)/i],
-    cmd: {
-        hangup: /^!(?:hangup|end)$/i,
-        hangupId: /^!(?:hangup|end)\s+(\S+)$/i,
-        answer: /^!answer\s+(\S+)$/i,
-        dispatch: /^!d\s+(\S+)\s+(.+)$/is,
-        status: /^!status$/i,
-        health: /^!health$/i,
-        help: /^!help$/i,
-    },
+// Hardcoded whitelist (mirror of Studio script for display purposes)
+const HARDCODED_USERS = {
+    3274640368: {name: "chuhkee_moss", guns: ["M1911", "M1928 TOMMY GUN"]},
+    1465067028: {name: "vud", guns: [".38 SNUBNOSE"]},
+    56548114: {name: "interstellarriptide", guns: [".38 SNUBNOSE"]},
+    1834081320: {name: "makai", guns: ["M1911", ".38 SNUBNOSE"]},
+    24749217: {name: "OGSnipes20", guns: [".38 SNUBNOSE", "M1911"]},
+    810924509: {name: "dirtsocksguy", guns: [".38 SNUBNOSE", "M1911"]},
+    1131986134: {name: "EngIishBloke", guns: [".38 SNUBNOSE", "M1911", "M1897 Shotgun"]},
+    2583816107: {name: "mossmanV3", guns: ["M1911"]},
+    56444111: {name: "Triggered_Guy", guns: ["M1911", "M1897 Shotgun", ".38 SNUBNOSE"]},
+    317024926: {name: "Oldraelew", guns: ["M1911"]},
+    2617148664: {name: "almightyzane", guns: ["M1911", ".38 SNUBNOSE"]},
+    1780276456: {name: "ffjosephii", guns: [".38 SNUBNOSE"]},
+    417784525: {name: "irwb", guns: [".38 SNUBNOSE"]},
+    388744626: {name: "Bigsquidz", guns: ["M1911", ".38 SNUBNOSE", "M1928 TOMMY GUN", "M1897 Shotgun"]},
+    469068528: {name: "lukas24422", guns: ["M1911", ".38 SNUBNOSE", "M1897 Shotgun"]},
+    1159919315: {name: "TheMeep_MeepGaming", guns: ["M1911"]},
+    8797665761: {name: "NickyParisi", guns: [".38 SNUBNOSE"]},
+    3433914248: {name: "elpepo_facha", guns: [".38 SNUBNOSE", "M1897 Shotgun"]},
+    8909620314: {name: "BambukoRebel", guns: [".38 SNUBNOSE", "M1911", "M1897 Shotgun"]},
+    1732659616: {name: "b0edser", guns: ["M1911"]},
+    3597328590: {name: "Lettuce_Funky0", guns: [".38 SNUBNOSE"]},
+    1424337553: {name: "ibexe_king", guns: ["M1911", "M1928 TOMMY GUN", ".38 SNUBNOSE"]},
+    1417614457: {name: "L0RENZO121", guns: [".38 SNUBNOSE"]},
+    1846610781: {name: "Kejiwafen", guns: [".38 SNUBNOSE", "M1911"]},
+    1464679925: {name: "ioanekingpro98", guns: [".38 SNUBNOSE", "M1897 Shotgun"]},
+    1830147413: {name: "Mr_Qbama", guns: ["M1911", ".38 SNUBNOSE", "M1897 Shotgun"]},
+    3170949659: {name: "RonaldCMorrison", guns: ["M1911", ".38 SNUBNOSE"]},
+    1351071106: {name: "gen_wrigs124", guns: [".38 SNUBNOSE"]},
+    1776017244: {name: "proboxgamer2013", guns: [".38 SNUBNOSE"]},
+    955487965: {name: "firekiller326", guns: [".38 SNUBNOSE"]},
+    814007398: {name: "galaxyboy_10000", guns: [".38 SNUBNOSE", "M1897 Shotgun"]},
+    2263443634: {name: "Ninja12361961", guns: [".38 SNUBNOSE"]},
+    986511712: {name: "TheFalling_FireStar", guns: [".38 SNUBNOSE"]},
+    445512125: {name: "ThiefenX", guns: [".38 SNUBNOSE"]},
+    1638404386: {name: "Anarchbund", guns: [".38 SNUBNOSE"]},
+    223857801: {name: "Skeletonik", guns: ["M1911"]},
+    544836564: {name: "IDJLOVER_9231", guns: [".38 SNUBNOSE"]},
+    27471332: {name: "Ludakres", guns: [".38 SNUBNOSE"]},
+    1696974243: {name: "coop_32123", guns: [".38 SNUBNOSE", "M1911"]},
+    3292035980: {name: "resoLsIorceN", guns: ["M1911"]},
+    1508649283: {name: "AllAboutToday2", guns: [".38 SNUBNOSE", "M1897 Shotgun"]},
+    1441492550: {name: "S1NISTERREALITY", guns: [".38 SNUBNOSE"]},
+    1844464778: {name: "IStoleYourBread12121", guns: ["M1911"]},
+    3587568832: {name: "Bob_CoolPlay", guns: [".38 SNUBNOSE"]},
+    4419542026: {name: "VHSClassics", guns: [".38 SNUBNOSE"]},
+    1637989816: {name: "UntilTheFlagStands", guns: ["M1911"]},
+    218499531: {name: "GGG12893", guns: ["M1911", "M1928 TOMMY GUN"]},
+    9519389212: {name: "RexkVaush", guns: ["M1911"]},
+    317824065: {name: "fordshelby", guns: [".38 SNUBNOSE"]},
+    113794875: {name: "Hacksaw307", guns: ["M1911", ".38 SNUBNOSE"]},
+    246411829: {name: "redkillertank", guns: [".38 SNUBNOSE"]},
+    3118272583: {name: "yeahmateaye", guns: [".38 SNUBNOSE"]},
+    15630577: {name: "connor030904", guns: [".38 SNUBNOSE", "M1897 Shotgun", "M1928 TOMMY GUN"]},
+    1361319250: {name: "Fawhausten", guns: ["M1911"]},
+    5813348341: {name: "XenoZuccx", guns: [".38 SNUBNOSE", "M1911"]},
+    424244958: {name: "Tezreta", guns: ["M1911", ".38 SNUBNOSE", "M1928 TOMMY GUN", "M1897 Shotgun"]},
+    1756102589: {name: "Farrell022", guns: [".38 SNUBNOSE"]},
+    1851718638: {name: "OrangeBlossom", guns: ["M1897 Shotgun"]},
+    866995178: {name: "HarlowlGuess", guns: ["M1911", ".38 SNUBNOSE", "M1928 TOMMY GUN"]},
+    85658932: {name: "Sluger20067", guns: ["M1928 TOMMY GUN"]},
+    105121893: {name: "Abyssal_deep", guns: ["M1911"]},
+    89366796: {name: "IvorySturm", guns: ["M1928 TOMMY GUN"]},
+    74456629: {name: "stopplayingpretend", guns: [".38 SNUBNOSE"]},
+    5146105380: {name: "JibMan224", guns: [".38 SNUBNOSE"]},
+    323942279: {name: "dreadedsabercut", guns: ["M1911"]},
+    159862881: {name: "Nikkov_1", guns: ["M1897 Shotgun", "M1911"]},
+    435924445: {name: "ammsjer", guns: ["M1911", "M1928 TOMMY GUN", "M1897 Shotgun"]},
+    5224923521: {name: "Wildcard_858", guns: ["M1911"]},
+    8336515931: {name: "Brolyfan98", guns: [".38 SNUBNOSE"]},
+    1951308725: {name: "koyslop", guns: ["M1911"]},
+    1976569166: {name: "CubeTheHoly", guns: [".38 SNUBNOSE"]},
 };
 
-// Logging
-const LOG_LEVEL = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
-const logLevel = LOG_LEVEL[process.env.LOG_LEVEL?.toUpperCase()] ?? LOG_LEVEL.INFO;
+// In-memory cache
+let whitelistCache = {};
 
-const log = {
-    fmt: (lvl, msg, meta) => {
-        const ts = new Date().toISOString();
-        return `[${ts}] [${lvl}] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`;
-    },
-    debug: (msg, meta) => logLevel <= LOG_LEVEL.DEBUG && console.log(log.fmt('DEBUG', msg, meta)),
-    info: (msg, meta) => logLevel <= LOG_LEVEL.INFO && console.log(log.fmt('INFO', msg, meta)),
-    warn: (msg, meta) => logLevel <= LOG_LEVEL.WARN && console.warn(log.fmt('WARN', msg, meta)),
-    error: (msg, meta) => console.error(log.fmt('ERROR', msg, meta)),
-};
+// Prevent duplicate message processing
+const processedMessages = new Set();
+const MAX_PROCESSED = 1000;
 
-// Utilities
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const sanitize = text => (text || '').substring(0, CFG.limits.msgLength).replace(/[\x00-\x1F\x7F]/g, '').trim();
-const sanitizeUsername = username => (username || 'Unknown').replace(/[^\w\s-]/g, '').substring(0, CFG.limits.usernameMax).trim() || 'Dispatcher';
-const validCallId = id => typeof id === 'string' && RE.callId.test(id);
-const generateCorrelationId = callId => `${callId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-
-// Rate Limiter
-class RateLimiter {
-    constructor(perSec) {
-        this.tokens = perSec;
-        this.max = perSec;
-        this.last = Date.now();
-    }
-
-    async acquire() {
-        while (true) {
-            const now = Date.now();
-            this.tokens = Math.min(this.max, this.tokens + ((now - this.last) / 1000) * this.max);
-            this.last = now;
-            if (this.tokens >= 1) { this.tokens--; return; }
-            await sleep(Math.ceil(((1 - this.tokens) / this.max) * 1000));
-        }
-    }
-}
-
-// Circuit Breaker
-class CircuitBreaker {
-    constructor(threshold, resetMs) {
-        this.threshold = threshold;
-        this.resetMs = resetMs;
-        this.failures = 0;
-        this.lastFail = null;
-        this.state = 'CLOSED';
-    }
-
-    canRequest() {
-        if (this.state === 'CLOSED') return true;
-        if (this.state === 'OPEN' && Date.now() - this.lastFail >= this.resetMs) {
-            this.state = 'HALF_OPEN';
-            return true;
-        }
-        return this.state === 'HALF_OPEN';
-    }
-
-    success() { this.failures = 0; this.state = 'CLOSED'; }
-
-    fail() {
-        this.failures++;
-        this.lastFail = Date.now();
-        if (this.state === 'HALF_OPEN' || this.failures >= this.threshold) {
-            this.state = 'OPEN';
-            log.warn('Circuit breaker opened', { failures: this.failures });
-        }
-    }
-
-    getState() { return { state: this.state, failures: this.failures }; }
-}
-
-const circuit = new CircuitBreaker(CFG.circuit.threshold, CFG.circuit.resetMs);
-
-// Processed Calls Tracker
-class ProcessedCallsTracker {
-    #callIds = new Map();
-    #messageIds = new Set();
-
-    markCallId(callId, correlationId) {
-        this.#callIds.set(callId, { timestamp: Date.now(), correlationId });
-        this.#evict();
-    }
-
-    markMessageId(messageId) { this.#messageIds.add(messageId); }
-
-    hasCallId(callId) {
-        const entry = this.#callIds.get(callId);
-        if (!entry) return false;
-        if (Date.now() - entry.timestamp > CFG.processedCalls.ttlMs) {
-            this.#callIds.delete(callId);
-            return false;
-        }
-        return true;
-    }
-
-    hasMessageId(messageId) { return this.#messageIds.has(messageId); }
-
-    #evict() {
-        if (this.#callIds.size <= CFG.processedCalls.maxSize) return;
-        const entries = [...this.#callIds.entries()]
-            .sort((a, b) => a[1].timestamp - b[1].timestamp)
-            .slice(0, CFG.processedCalls.evictCount);
-        entries.forEach(([id]) => this.#callIds.delete(id));
-        if (this.#messageIds.size > CFG.processedCalls.maxSize) {
-            [...this.#messageIds].slice(0, CFG.processedCalls.evictCount).forEach(id => this.#messageIds.delete(id));
-        }
-        log.info('Evicted old processed entries', { evicted: entries.length });
-    }
-
-    size() { return this.#callIds.size; }
-}
-
-const processedCalls = new ProcessedCallsTracker();
-
-// LRU Node
-class LRUNode {
-    constructor(key, value) {
-        this.key = key;
-        this.value = value;
-        this.prev = null;
-        this.next = null;
-    }
-}
-
-// Thread Manager
-class ThreadManager {
-    #map = new Map();
-    #callIndex = new Map();
-    #head = null;
-    #tail = null;
-    #timer = null;
-    #stats = { active: 0, answered: 0, created: 0, closed: 0 };
-
-    constructor() { this.#startCleanup(); }
-
-    #moveToHead(node) {
-        if (node === this.#head) return;
-        if (node.prev) node.prev.next = node.next; else this.#head = node.next;
-        if (node.next) node.next.prev = node.prev; else this.#tail = node.prev;
-        node.prev = node.next = null;
-        if (this.#head) { this.#head.prev = node; node.next = this.#head; }
-        this.#head = node;
-        if (!this.#tail) this.#tail = node;
-    }
-
-    #addToHead(node) {
-        node.prev = null;
-        node.next = this.#head;
-        if (this.#head) this.#head.prev = node;
-        this.#head = node;
-        if (!this.#tail) this.#tail = node;
-    }
-
-    #removeTail() {
-        if (!this.#tail) return null;
-        const node = this.#tail;
-        if (node.prev) { this.#tail = node.prev; this.#tail.next = null; }
-        else { this.#head = this.#tail = null; }
-        node.prev = node.next = null;
-        return node;
-    }
-
-    #removeNode(node) {
-        if (node.prev) node.prev.next = node.next; else this.#head = node.next;
-        if (node.next) node.next.prev = node.prev; else this.#tail = node.prev;
-        node.prev = node.next = null;
-    }
-
-    create(threadId, callId, callType, correlationId) {
-        if (!validCallId(callId)) return null;
-        if (this.#map.size >= CFG.threads.max) {
-            const evicted = this.#removeTail();
-            if (evicted) {
-                this.#map.delete(evicted.key);
-                this.#callIndex.delete(evicted.value.callId);
-                this.#stats.active--;
-                if (evicted.value.answered) this.#stats.answered--;
-                this.#stats.closed++;
-                log.info('Thread evicted (LRU)', { threadId: evicted.key, callId: evicted.value.callId });
-            }
-        }
-        const existing = this.#callIndex.get(callId);
-        if (existing && this.#map.has(existing)) {
-            const node = this.#map.get(existing);
-            this.#moveToHead(node);
-            return node.value;
-        }
-        const data = {
-            threadId, callId, callType, correlationId,
-            answered: false, lastActivity: Date.now(), messages: 0, archived: false,
-        };
-        const node = new LRUNode(threadId, data);
-        this.#map.set(threadId, node);
-        this.#callIndex.set(callId, threadId);
-        this.#addToHead(node);
-        this.#stats.active++;
-        this.#stats.created++;
-        log.info('Thread created', { threadId, callId, callType });
-        return data;
-    }
-
-    get(threadId) {
-        const node = this.#map.get(threadId);
-        if (!node) return undefined;
-        node.value.lastActivity = Date.now();
-        this.#moveToHead(node);
-        return node.value;
-    }
-
-    getByCallId(callId) {
-        const threadId = this.#callIndex.get(callId);
-        return threadId ? this.get(threadId) : undefined;
-    }
-
-    hasCallId(callId) { return this.#callIndex.has(callId); }
-
-    markAnswered(threadId) {
-        const node = this.#map.get(threadId);
-        if (!node) return false;
-        if (!node.value.answered) { node.value.answered = true; this.#stats.answered++; }
-        node.value.lastActivity = Date.now();
-        this.#moveToHead(node);
-        return true;
-    }
-
-    markArchived(threadId) {
-        const node = this.#map.get(threadId);
-        if (node) { node.value.archived = true; node.value.lastActivity = Date.now(); }
-    }
-
-    recordMessage(threadId) {
-        const node = this.#map.get(threadId);
-        if (node) { node.value.messages++; node.value.lastActivity = Date.now(); this.#moveToHead(node); }
-    }
-
-    close(threadId, reason = 'closed') {
-        const node = this.#map.get(threadId);
-        if (!node) return null;
-        this.#removeNode(node);
-        this.#map.delete(threadId);
-        this.#callIndex.delete(node.value.callId);
-        this.#stats.active--;
-        if (node.value.answered) this.#stats.answered--;
-        this.#stats.closed++;
-        log.info('Thread closed', { threadId, callId: node.value.callId, reason });
-        return node.value;
-    }
-
-    getStats() {
-        return {
-            active: this.#stats.active,
-            answered: this.#stats.answered,
-            waiting: this.#stats.active - this.#stats.answered,
-            circuit: circuit.getState(),
-            processedCalls: processedCalls.size(),
-        };
-    }
-
-    getStaleThreads() {
-        const now = Date.now(), stale = [];
-        let current = this.#tail;
-        while (current) {
-            if (now - current.value.lastActivity > CFG.threads.staleMs) {
-                stale.push({ threadId: current.key, ...current.value });
-            }
-            current = current.prev;
-        }
-        return stale;
-    }
-
-    async #cleanup() {
-        const stale = this.getStaleThreads();
-        for (const data of stale) {
-            if (data.answered && !data.archived) {
-                await sendToRoblox('DispatcherAction', {
-                    callId: data.callId, action: 'hangup', dispatcher: 'System',
-                }, data.correlationId);
-            }
-            this.close(data.threadId, 'stale');
-            try {
-                const thread = await client.channels.fetch(data.threadId).catch(() => null);
-                if (thread?.isThread?.() && !thread.archived) await thread.setArchived(true);
-            } catch (err) {
-                log.warn('Failed to archive stale thread', { threadId: data.threadId, error: err.message });
-            }
-        }
-        if (stale.length) log.info('Cleanup complete', { removed: stale.length, remaining: this.#stats.active });
-    }
-
-    #startCleanup() {
-        this.#timer = setInterval(() => this.#cleanup().catch(err => log.warn('Cleanup error', { error: err.message })), CFG.threads.cleanupMs);
-        this.#timer.unref();
-    }
-
-    destroy() { if (this.#timer) { clearInterval(this.#timer); this.#timer = null; } }
-}
-
-// Roblox API
-const agent = new https.Agent({ keepAlive: true, maxSockets: 10 });
-const limiter = new RateLimiter(CFG.rate.perSec);
-const discordLimiter = new RateLimiter(CFG.discord.perSec);
-let inFlightRequests = 0;
-
-async function sendToRoblox(topic, data, correlationId) {
-    if (!circuit.canRequest()) {
-        log.warn('Circuit open, rejecting request', { topic, correlationId });
-        return { success: false, error: 'Circuit open - system overloaded' };
-    }
-    const payload = { ...data };
-    if (payload.text) payload.text = sanitize(payload.text);
-    if (payload.message) payload.message = sanitize(payload.message);
-    if (payload.dispatcher) payload.dispatcher = sanitizeUsername(payload.dispatcher);
-    inFlightRequests++;
-    try {
-        for (let attempt = 1; attempt <= CFG.rate.retries; attempt++) {
-            try {
-                await limiter.acquire();
-                const result = await robloxRequest(topic, payload, correlationId);
-                if (result.status >= 200 && result.status < 300) {
-                    circuit.success();
-                    log.debug('Roblox API success', { topic, correlationId, attempt });
-                    return { success: true };
-                }
-                if (result.status === 429) {
-                    const retry = parseInt(result.headers['retry-after'], 10);
-                    const waitMs = !isNaN(retry) && retry > 0 ? retry * 1000 : CFG.rate.baseDelayMs;
-                    log.warn('Roblox rate limited', { retryAfter: retry, correlationId });
-                    await sleep(Math.min(waitMs, CFG.rate.maxDelayMs));
-                    continue;
-                }
-                if (result.status >= 500) throw new Error('Server error: ' + result.status);
-                circuit.fail();
-                return { success: false, error: 'HTTP ' + result.status };
-            } catch (err) {
-                log.warn('Roblox API failed', { topic, attempt, error: err.message, correlationId });
-                if (attempt < CFG.rate.retries) {
-                    await sleep(Math.min(CFG.rate.baseDelayMs * Math.pow(2, attempt - 1), CFG.rate.maxDelayMs));
-                }
-            }
-        }
-        circuit.fail();
-        return { success: false, error: 'Max retries exceeded' };
-    } finally {
-        inFlightRequests--;
-    }
-}
-
-function robloxRequest(topic, data, correlationId) {
+/**
+ * Make Open Cloud DataStore request
+ */
+function datastoreRequest(method, entryKey, data = null) {
     return new Promise((resolve, reject) => {
-        const body = JSON.stringify({ message: JSON.stringify(data) });
-        const req = https.request({
-            hostname: CFG.roblox.host,
-            path: CFG.roblox.path + '/universes/' + CFG.roblox.universeId + '/topics/' + topic,
-            method: 'POST',
-            agent,
-            headers: {
-                'x-api-key': CFG.roblox.apiKey,
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(body),
-                'X-Correlation-ID': correlationId || 'unknown',
-            },
-            timeout: CFG.roblox.timeoutMs,
-        }, res => {
+        const basePath = `/datastores/v1/universes/${ROBLOX_UNIVERSE_ID}/standard-datastores/datastore/entries/entry`;
+        const query = `?datastoreName=${encodeURIComponent(DATASTORE_NAME)}&entryKey=${encodeURIComponent(entryKey)}`;
+        
+        const headers = {
+            'x-api-key': ROBLOX_DATASTORE_KEY,
+        };
+
+        let body = null;
+        if (data) {
+            body = JSON.stringify(data);
+            headers['Content-Type'] = 'application/json';
+            headers['Content-Length'] = Buffer.byteLength(body);
+            headers['content-md5'] = crypto.createHash('md5').update(body).digest('base64');
+        }
+
+        const options = {
+            hostname: 'apis.roblox.com',
+            path: basePath + query,
+            method: method,
+            headers: headers,
+        };
+
+        const req = https.request(options, res => {
             let responseData = '';
-            res.on('data', chunk => (responseData += chunk));
-            res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: responseData }));
+            res.on('data', chunk => responseData += chunk);
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    try {
+                        resolve(responseData ? JSON.parse(responseData) : {});
+                    } catch {
+                        resolve(responseData);
+                    }
+                } else if (res.statusCode === 404) {
+                    resolve(null); // Entry doesn't exist yet
+                } else {
+                    reject(new Error(`DataStore error: ${res.statusCode} - ${responseData}`));
+                }
+            });
         });
+
         req.on('error', reject);
-        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-        req.write(body);
+        if (body) req.write(body);
         req.end();
     });
 }
 
-// Embed parsing
-function parseEmbed(embed) {
-    if (!embed?.title) return null;
-    const callType = embed.title.includes('911') ? '911' : embed.title.includes('311') ? '311' : null;
-    if (!callType) return null;
-    let callId = null, status = null, callback = 'Unknown';
-    if (embed.description) {
-        const match = embed.description.match(/Call\s*ID[:\s]+([A-Za-z0-9_-]+)/i);
-        if (match?.[1] && validCallId(match[1])) callId = match[1];
-    }
-    for (const field of embed.fields || []) {
-        const name = (field.name || '').toLowerCase(), value = field.value || '';
-        if (!callId && (name.includes('call id') || name.includes('callid'))) {
-            const match = value.match(/([A-Za-z0-9_-]+)/);
-            if (match?.[1] && validCallId(match[1])) callId = match[1];
-        }
-        if (name.includes('status')) status = value;
-        else if (name.includes('callback') || name.includes('number')) callback = sanitize(value || 'Unknown');
-    }
-    return { callType, callId, status, callback };
-}
-
-// Discord client
-const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-});
-
-const threads = new ThreadManager();
-
-// Discord reconnection handling
-client.on('shardDisconnect', (event, shardId) => log.warn('Discord disconnected', { shardId, code: event?.code }));
-client.on('shardReconnecting', shardId => log.info('Discord reconnecting', { shardId }));
-client.on('shardResume', shardId => log.info('Discord reconnected', { shardId }));
-client.on('shardError', (error, shardId) => log.error('Discord shard error', { shardId, error: error.message }));
-
-// Message handler
-client.on('messageCreate', async msg => {
-    if (!msg.author) return;
-    if (await handleWhitelistCommand(msg)) return;
+/**
+ * Get whitelist from DataStore
+ */
+async function getWhitelist() {
     try {
-        if (msg.webhookId && msg.embeds?.length) await handleIncoming(msg);
-        else if (!msg.author.bot && msg.content?.trim()) await handleUser(msg);
-    } catch (err) {
-        log.error('Handler error', { error: err.message, stack: err.stack });
+        const data = await datastoreRequest('GET', ENTRY_KEY);
+        return data || {};
+    } catch (e) {
+        console.error('[Whitelist] Failed to get:', e.message);
+        return {};
     }
-});
+}
 
-async function handleIncoming(msg) {
-    if (processedCalls.hasMessageId(msg.id)) {
-        log.debug('Duplicate message ignored', { messageId: msg.id });
-        return;
-    }
-    processedCalls.markMessageId(msg.id);
-    const parsed = parseEmbed(msg.embeds[0]);
-    if (!parsed?.callType || !parsed.callId) {
-        log.debug('Invalid embed format', { hasTitle: !!msg.embeds[0]?.title });
-        return;
-    }
-    if (!parsed.status?.toUpperCase().includes('RINGING')) {
-        log.debug('Ignoring non-ringing status', { status: parsed.status, callId: parsed.callId });
-        return;
-    }
-    if (processedCalls.hasCallId(parsed.callId) || threads.hasCallId(parsed.callId)) {
-        log.debug('Duplicate call ignored', { callId: parsed.callId });
-        return;
-    }
-    const correlationId = generateCorrelationId(parsed.callId);
-    processedCalls.markCallId(parsed.callId, correlationId);
+/**
+ * Save whitelist to DataStore
+ */
+async function saveWhitelist(whitelist) {
     try {
-        await discordLimiter.acquire();
-        const thread = await msg.startThread({
-            name: (parsed.callType + ' Call - ' + parsed.callId).substring(0, CFG.limits.threadNameMax),
-            autoArchiveDuration: CFG.threads.archiveMins,
-        });
-        const threadData = threads.create(thread.id, parsed.callId, parsed.callType, correlationId);
-        if (!threadData) { await thread.delete().catch(() => {}); return; }
-        const type = parsed.callType === '911' ? 'EMERGENCY' : 'NON-EMERGENCY';
-        await discordLimiter.acquire();
-        await thread.send('<@&' + CFG.dispatcher + '>\n**INCOMING ' + parsed.callType + ' ' + type + ' CALL**\n\nSend a message to answer.\n`!hangup` to end.');
-        log.info('Thread created on webhook message', { threadId: thread.id, callId: parsed.callId });
-    } catch (err) {
-        log.error('Thread creation failed', { error: err.message, callId: parsed.callId });
+        await datastoreRequest('POST', ENTRY_KEY, whitelist);
+        whitelistCache = whitelist;
+        return true;
+    } catch (e) {
+        console.error('[Whitelist] Failed to save:', e.message);
+        return false;
     }
 }
 
-async function handleUser(msg) {
-    const content = msg.content.trim();
-    const isThread = msg.channel.type === ChannelType.PublicThread || msg.channel.type === ChannelType.PrivateThread;
-    if (isThread) {
-        const data = threads.get(msg.channel.id);
-        if (data) { await handleThread(msg, data, content); return; }
-    }
-    await handleCommand(msg, content);
-}
-
-async function handleThread(msg, data, content) {
-    const { callId, answered, callType, correlationId } = data;
-    if (RE.cmd.hangup.test(content)) {
-        const result = await sendToRoblox('DispatcherAction', {
-            callId, action: 'hangup', dispatcher: msg.author.username, threadId: msg.channel.id,
-        }, correlationId);
-        if (result.success) {
-            await msg.reply(callType + ' call ended.');
-            threads.close(msg.channel.id, 'hangup');
-            await discordLimiter.acquire();
-            await msg.channel.setArchived(true).catch(() => {});
-        } else {
-            await msg.reply('Failed: ' + result.error);
+/**
+ * Parse gun names from input
+ */
+function parseGuns(input) {
+    const guns = [];
+    const normalized = input.toUpperCase();
+    
+    for (const gun of VALID_GUNS) {
+        if (normalized.includes(gun.toUpperCase())) {
+            guns.push(gun);
         }
-        return;
     }
-    const text = sanitize(content);
-    if (!text) return;
-    if (!answered) {
-        const result = await sendToRoblox('DispatcherAction', {
-            callId, action: 'answer', dispatcher: msg.author.username, message: text, threadId: msg.channel.id,
-        }, correlationId);
-        if (result.success) {
-            threads.markAnswered(msg.channel.id);
-            threads.recordMessage(msg.channel.id);
-            await msg.reply('Connected: Message sent to caller.');
-        } else {
-            await msg.reply('Failed to connect: ' + result.error);
+    
+    if (guns.length === 0) {
+        const parts = input.split(/[,;]+/).map(s => s.trim());
+        for (const part of parts) {
+            const match = VALID_GUNS.find(g => 
+                g.toUpperCase() === part.toUpperCase() ||
+                g.toUpperCase().includes(part.toUpperCase())
+            );
+            if (match && !guns.includes(match)) guns.push(match);
         }
-        return;
     }
-    const result = await sendToRoblox('DispatcherMessage', {
-        callId, text, dispatcher: msg.author.username, threadId: msg.channel.id,
-    }, correlationId);
-    if (result.success) threads.recordMessage(msg.channel.id);
-    else await msg.reply('Failed to send: ' + result.error);
+    
+    return guns;
 }
 
-async function handleCommand(msg, content) {
-    if (RE.cmd.status.test(content)) {
-        const s = threads.getStats();
-        await msg.reply('**Bot Status**\nActive Calls: ' + s.active + '\nAnswered: ' + s.answered + '\nWaiting: ' + s.waiting + '\nCircuit: ' + s.circuit.state + '\nProcessed: ' + s.processedCalls);
-        return;
-    }
-    if (RE.cmd.health.test(content)) {
-        const s = threads.getStats(), healthy = s.circuit.state === 'CLOSED';
-        await msg.reply('**System Health**\nStatus: ' + (healthy ? 'Healthy' : 'Degraded') + '\nUptime: ' + Math.floor(process.uptime()) + 's\nCircuit: ' + s.circuit.state + '\nIn-flight: ' + inFlightRequests);
-        return;
-    }
-    if (RE.cmd.help.test(content)) {
-        await msg.reply('**Commands**\n`!status` - Bot status\n`!health` - System health\n`!hangup` - End call (in thread)\n`!answer <id>` - Answer manually\n`!d <id> <msg>` - Send message\n`!hangup <id>` - End specific call');
-        return;
-    }
-    let match = content.match(RE.cmd.answer);
-    if (match) {
-        if (!validCallId(match[1])) { await msg.reply('Invalid call ID.'); return; }
-        const correlationId = generateCorrelationId(match[1]);
-        const result = await sendToRoblox('DispatcherAction', { callId: match[1], action: 'answer', dispatcher: msg.author.username }, correlationId);
-        await msg.reply(result.success ? 'Answer sent.' : 'Failed: ' + result.error);
-        return;
-    }
-    match = content.match(RE.cmd.dispatch);
-    if (match) {
-        if (!validCallId(match[1])) { await msg.reply('Invalid call ID.'); return; }
-        const correlationId = generateCorrelationId(match[1]);
-        const result = await sendToRoblox('DispatcherMessage', { callId: match[1], text: sanitize(match[2]), dispatcher: msg.author.username }, correlationId);
-        await msg.reply(result.success ? 'Sent.' : 'Failed: ' + result.error);
-        return;
-    }
-    match = content.match(RE.cmd.hangupId);
-    if (match) {
-        if (!validCallId(match[1])) { await msg.reply('Invalid call ID.'); return; }
-        const correlationId = generateCorrelationId(match[1]);
-        const result = await sendToRoblox('DispatcherAction', { callId: match[1], action: 'hangup', dispatcher: msg.author.username }, correlationId);
-        await msg.reply(result.success ? 'Call ended.' : 'Failed: ' + result.error);
-    }
-}
-
-// Health server
-const app = express();
-
-app.get('/', (req, res) => res.json({
-    status: 'online', uptime: Math.floor(process.uptime()), inFlight: inFlightRequests, ...threads.getStats(),
-}));
-
-app.get('/health', (req, res) => {
-    const stats = threads.getStats();
-    const healthy = stats.circuit.state === 'CLOSED' && inFlightRequests < 50;
-    res.status(healthy ? 200 : 503).json({
-        status: healthy ? 'healthy' : 'degraded',
-        uptime: Math.floor(process.uptime()),
-        circuit: stats.circuit,
-        inFlight: inFlightRequests,
-        threads: { active: stats.active, answered: stats.answered },
+/**
+ * Format whitelist for Discord display
+ */
+function formatList(whitelist) {
+    const entries = Object.entries(whitelist);
+    if (entries.length === 0) return '*No runtime entries (check hardcoded list in script)*';
+    
+    const lines = entries.map(([id, data]) => {
+        const guns = (data.guns || []).join(', ');
+        const name = data.name || 'Unknown';
+        return `\`${id}\` (${name}): ${guns}`;
     });
-});
-
-const server = app.listen(CFG.port, () => log.info('Server on port ' + CFG.port));
-
-// Graceful shutdown
-let stopping = false;
-
-async function shutdown(signal) {
-    if (stopping) return;
-    stopping = true;
-    log.info(signal + ' received, shutting down');
-    server.close();
-    const deadline = Date.now() + CFG.shutdownGraceMs;
-    while (inFlightRequests > 0 && Date.now() < deadline) {
-        log.info('Waiting for ' + inFlightRequests + ' in-flight requests');
-        await sleep(500);
+    
+    if (lines.join('\n').length > 1900) {
+        return lines.slice(0, 30).join('\n') + `\n... and ${lines.length - 30} more`;
     }
-    if (inFlightRequests > 0) log.warn('Shutdown timeout, ' + inFlightRequests + ' requests abandoned');
-    threads.destroy();
-    client.destroy();
-    agent.destroy();
-    await sleep(500);
-    process.exit(0);
+    return lines.join('\n');
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('unhandledRejection', reason => log.error('Unhandled rejection', { error: reason?.message || String(reason) }));
+/**
+ * Handle whitelist commands
+ */
+async function handleWhitelistCommand(msg) {
+    // Prevent duplicate processing FIRST
+    if (processedMessages.has(msg.id)) {
+        console.log('[Whitelist] Duplicate message blocked:', msg.id);
+        return true;
+    }
+    processedMessages.add(msg.id);
+    if (processedMessages.size > MAX_PROCESSED) {
+        const first = processedMessages.values().next().value;
+        processedMessages.delete(first);
+    }
+    
+    if (msg.channel.id !== WHITELIST_CHANNEL_ID) return false;
+    if (msg.author.bot) return false;
+    
+    const content = msg.content.trim();
+    if (!content.startsWith('!whitelist')) return false;
+    let match;
+    
+    // Help
+    if (CMD.help.test(content)) {
+        await msg.reply(
+            '**Whitelist Commands**\n' +
+            '`!whitelist add <userId> <guns>` - Add user (runtime)\n' +
+            '`!whitelist remove <userId> [guns]` - Remove user or guns\n' +
+            '`!whitelist lookup <userId>` - Check user\'s guns\n' +
+            '`!whitelist list` - Show runtime entries only\n' +
+            '`!whitelist all` - Show ALL users (hardcoded + runtime)\n' +
+            '`!whitelist sync` - Force sync cache\n\n' +
+            '**Available Guns:** ' + VALID_GUNS.join(', ')
+        );
+        return true;
+    }
+    
+    // List runtime only
+    if (CMD.list.test(content)) {
+        const whitelist = await getWhitelist();
+        await msg.reply('**Runtime Whitelist Entries:**\n' + formatList(whitelist));
+        return true;
+    }
+    
+    // List ALL (hardcoded + runtime)
+    if (CMD.listAll.test(content)) {
+        const runtime = await getWhitelist();
+        const allUsers = new Map();
+        
+        // Add hardcoded users
+        for (const [id, data] of Object.entries(HARDCODED_USERS)) {
+            allUsers.set(id, { ...data, source: 'STUDIO' });
+        }
+        
+        // Overlay runtime users
+        for (const [id, data] of Object.entries(runtime)) {
+            if (allUsers.has(id)) {
+                const existing = allUsers.get(id);
+                const mergedGuns = [...new Set([...existing.guns, ...(data.guns || [])])];
+                allUsers.set(id, { ...existing, guns: mergedGuns, source: 'BOTH' });
+            } else {
+                allUsers.set(id, { name: data.name || 'Unknown', guns: data.guns || [], source: 'RUNTIME' });
+            }
+        }
+        
+        const lines = [];
+        for (const [id, data] of allUsers) {
+            const tag = data.source === 'BOTH' ? '[BOTH]' : data.source === 'RUNTIME' ? '[RUNTIME]' : '[STUDIO]';
+            lines.push(`${tag} \`${id}\` (${data.name}): ${data.guns.join(', ')}`);
+        }
+        
+        let response = `**All Whitelisted Users (${allUsers.size} total)**\n`;
+        response += `[STUDIO] = Studio | [RUNTIME] = Runtime | [BOTH] = Both\n\n`;
+        
+        if (lines.join('\n').length > 1800) {
+            response += lines.slice(0, 40).join('\n') + `\n... and ${lines.length - 40} more`;
+        } else {
+            response += lines.join('\n');
+        }
+        
+        await msg.reply(response);
+        return true;
+    }
+    
+    // Sync
+    if (CMD.sync.test(content)) {
+        whitelistCache = await getWhitelist();
+        await msg.reply(`Synced ${Object.keys(whitelistCache).length} runtime entries`);
+        return true;
+    }
+    
+    // Lookup (checks both hardcoded and runtime)
+    match = content.match(CMD.lookup);
+    if (match) {
+        const runtime = await getWhitelist();
+        const userId = match[1];
+        const runtimeEntry = runtime[userId];
+        const hardcodedEntry = HARDCODED_USERS[parseInt(userId)];
+        
+        if (runtimeEntry || hardcodedEntry) {
+            let guns = [];
+            let sources = [];
+            let name = 'Unknown';
+            
+            if (hardcodedEntry) {
+                guns.push(...hardcodedEntry.guns);
+                sources.push('Studio');
+                name = hardcodedEntry.name;
+            }
+            if (runtimeEntry) {
+                guns.push(...(runtimeEntry.guns || []));
+                sources.push('Runtime');
+                if (runtimeEntry.name) name = runtimeEntry.name;
+            }
+            
+            const uniqueGuns = [...new Set(guns)];
+            await msg.reply(`**User ${userId}** (${name})\nSource: ${sources.join(' + ')}\nGuns: ${uniqueGuns.join(', ')}`);
+        } else {
+            await msg.reply(`User \`${userId}\` is not whitelisted.`);
+        }
+        return true;
+    }
+    
+    // Add
+    match = content.match(CMD.add);
+    if (match) {
+        const userId = match[1];
+        const gunInput = match[2];
+        const guns = parseGuns(gunInput);
+        
+        if (guns.length === 0) {
+            await msg.reply(`No valid guns found. Available: ${VALID_GUNS.join(', ')}`);
+            return true;
+        }
+        
+        const whitelist = await getWhitelist();
+        
+        if (whitelist[userId]) {
+            const existing = whitelist[userId].guns || [];
+            whitelist[userId].guns = [...new Set([...existing, ...guns])];
+            whitelist[userId].updatedBy = msg.author.username;
+            whitelist[userId].updatedAt = new Date().toISOString();
+        } else {
+            whitelist[userId] = {
+                guns,
+                name: null,
+                addedBy: msg.author.username,
+                addedAt: new Date().toISOString(),
+            };
+        }
+        
+        if (await saveWhitelist(whitelist)) {
+            await msg.reply(`Added \`${userId}\` with: ${guns.join(', ')}\n*Update Successful*`);
+        } else {
+            await msg.reply(`Failed to update DataStore`);
+        }
+        return true;
+    }
+    
+    // Remove
+    match = content.match(CMD.remove);
+    if (match) {
+        const userId = match[1];
+        const gunInput = match[2];
+        
+        const whitelist = await getWhitelist();
+        
+        if (!whitelist[userId]) {
+            await msg.reply(`User \`${userId}\` not in runtime whitelist.`);
+            return true;
+        }
+        
+        if (gunInput) {
+            const gunsToRemove = parseGuns(gunInput);
+            whitelist[userId].guns = whitelist[userId].guns.filter(
+                g => !gunsToRemove.includes(g)
+            );
+            
+            if (whitelist[userId].guns.length === 0) {
+                delete whitelist[userId];
+                await msg.reply(`Removed \`${userId}\` entirely`);
+            } else {
+                await msg.reply(`Removed from \`${userId}\`: ${gunsToRemove.join(', ')}`);
+            }
+        } else {
+            delete whitelist[userId];
+            await msg.reply(`Removed \`${userId}\` from runtime whitelist`);
+        }
+        
+        await saveWhitelist(whitelist);
+        return true;
+    }
+    
+    return false;
+}
 
-// Start
-client.once('ready', async () => {
-    log.info('Ready as ' + client.user.tag);
-    await initWhitelist();
-});
+/**
+ * Initialize
+ */
+async function initWhitelist() {
+    if (!ROBLOX_UNIVERSE_ID || !ROBLOX_DATASTORE_KEY) {
+        console.warn('[Whitelist] Missing ROBLOX_UNIVERSE_ID or ROBLOX_DATASTORE_KEY');
+        return false;
+    }
+    if (!WHITELIST_CHANNEL_ID) {
+        console.warn('[Whitelist] Missing WHITELIST_CHANNEL_ID');
+        return false;
+    }
+    try {
+        whitelistCache = await getWhitelist();
+        console.log(`[Whitelist] Loaded ${Object.keys(whitelistCache).length} runtime entries`);
+        return true;
+    } catch (e) {
+        console.error('[Whitelist] Init failed:', e.message);
+        return false;
+    }
+}
 
-client.on('error', err => log.error('Client error', { error: err.message }));
-
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-    log.error('Login failed', { error: err.message });
-    process.exit(1);
-});
+module.exports = {
+    handleWhitelistCommand,
+    initWhitelist,
+    VALID_GUNS,
+};
