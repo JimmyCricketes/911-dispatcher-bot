@@ -14,7 +14,7 @@ const https = require('https');
 const crypto = require('crypto');
 
 const ROBLOX_UNIVERSE_ID = process.env.ROBLOX_UNIVERSE_ID || process.env.UNIVERSE_ID;
-const ROBLOX_DATASTORE_KEY = process.env.ROBLOX_DATASTORE_KEY;
+const ROBLOX_DATASTORE_KEY = process.env.ROBLOX_DATASTORE_KEY || process.env.ROBLOX_API_KEY;
 const WHITELIST_CHANNEL_ID = process.env.WHITELIST_CHANNEL_ID;
 
 const DATASTORE_NAME = 'GunWhitelist';
@@ -397,7 +397,7 @@ async function handleWhitelistCommand(msg) {
         }
         
         if (await saveWhitelist(whitelist)) {
-            await msg.reply(`Added \`${userId}\` with: ${guns.join(', ')}\n*Live in-game now!*`);
+            await msg.reply(`Added \`${userId}\` with: ${guns.join(', ')}\n*Update Successful*`);
         } else {
             await msg.reply(`Failed to update DataStore`);
         }
