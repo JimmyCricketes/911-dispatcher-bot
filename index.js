@@ -10,6 +10,9 @@ const express = require('express');
 const https = require('https');
 const crypto = require('crypto');
 
+// Whitelist system
+const { handleWhitelistCommand, initWhitelist } = require('./whitelist-opencloud');
+
 // Environment validation
 const REQUIRED_ENV = ['DISCORD_TOKEN', 'UNIVERSE_ID', 'ROBLOX_API_KEY', 'DISPATCHER_PING'];
 const missing = REQUIRED_ENV.filter(k => !process.env[k]?.trim());
@@ -60,7 +63,10 @@ const LOG_LEVEL = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
 const logLevel = LOG_LEVEL[process.env.LOG_LEVEL?.toUpperCase()] ?? LOG_LEVEL.INFO;
 
 const log = {
-    fmt: (lvl, msg, meta) => `[${new Date().toISOString()}] [${lvl}] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`,
+    fmt: (lvl, msg, meta) => {
+        const ts = new Date().toISOString();
+        return `[${ts}] [${lvl}] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`;
+    },
     debug: (msg, meta) => logLevel <= LOG_LEVEL.DEBUG && console.log(log.fmt('DEBUG', msg, meta)),
     info: (msg, meta) => logLevel <= LOG_LEVEL.INFO && console.log(log.fmt('INFO', msg, meta)),
     warn: (msg, meta) => logLevel <= LOG_LEVEL.WARN && console.warn(log.fmt('WARN', msg, meta)),
@@ -154,17 +160,13 @@ class ProcessedCallsTracker {
 
     #evict() {
         if (this.#callIds.size <= CFG.processedCalls.maxSize) return;
-
         const entries = [...this.#callIds.entries()]
             .sort((a, b) => a[1].timestamp - b[1].timestamp)
             .slice(0, CFG.processedCalls.evictCount);
-
         entries.forEach(([id]) => this.#callIds.delete(id));
-
         if (this.#messageIds.size > CFG.processedCalls.maxSize) {
             [...this.#messageIds].slice(0, CFG.processedCalls.evictCount).forEach(id => this.#messageIds.delete(id));
         }
-
         log.info('Evicted old processed entries', { evicted: entries.length });
     }
 
@@ -229,7 +231,6 @@ class ThreadManager {
 
     create(threadId, callId, callType, correlationId) {
         if (!validCallId(callId)) return null;
-
         if (this.#map.size >= CFG.threads.max) {
             const evicted = this.#removeTail();
             if (evicted) {
@@ -241,26 +242,22 @@ class ThreadManager {
                 log.info('Thread evicted (LRU)', { threadId: evicted.key, callId: evicted.value.callId });
             }
         }
-
         const existing = this.#callIndex.get(callId);
         if (existing && this.#map.has(existing)) {
             const node = this.#map.get(existing);
             this.#moveToHead(node);
             return node.value;
         }
-
         const data = {
             threadId, callId, callType, correlationId,
             answered: false, lastActivity: Date.now(), messages: 0, archived: false,
         };
         const node = new LRUNode(threadId, data);
-
         this.#map.set(threadId, node);
         this.#callIndex.set(callId, threadId);
         this.#addToHead(node);
         this.#stats.active++;
         this.#stats.created++;
-
         log.info('Thread created', { threadId, callId, callType });
         return data;
     }
@@ -302,14 +299,12 @@ class ThreadManager {
     close(threadId, reason = 'closed') {
         const node = this.#map.get(threadId);
         if (!node) return null;
-
         this.#removeNode(node);
         this.#map.delete(threadId);
         this.#callIndex.delete(node.value.callId);
         this.#stats.active--;
         if (node.value.answered) this.#stats.answered--;
         this.#stats.closed++;
-
         log.info('Thread closed', { threadId, callId: node.value.callId, reason });
         return node.value;
     }
@@ -338,7 +333,6 @@ class ThreadManager {
 
     async #cleanup() {
         const stale = this.getStaleThreads();
-
         for (const data of stale) {
             if (data.answered && !data.archived) {
                 await sendToRoblox('DispatcherAction', {
@@ -346,7 +340,6 @@ class ThreadManager {
                 }, data.correlationId);
             }
             this.close(data.threadId, 'stale');
-
             try {
                 const thread = await client.channels.fetch(data.threadId).catch(() => null);
                 if (thread?.isThread?.() && !thread.archived) await thread.setArchived(true);
@@ -354,7 +347,6 @@ class ThreadManager {
                 log.warn('Failed to archive stale thread', { threadId: data.threadId, error: err.message });
             }
         }
-
         if (stale.length) log.info('Cleanup complete', { removed: stale.length, remaining: this.#stats.active });
     }
 
@@ -370,7 +362,6 @@ class ThreadManager {
 const agent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 const limiter = new RateLimiter(CFG.rate.perSec);
 const discordLimiter = new RateLimiter(CFG.discord.perSec);
-
 let inFlightRequests = 0;
 
 async function sendToRoblox(topic, data, correlationId) {
@@ -378,26 +369,21 @@ async function sendToRoblox(topic, data, correlationId) {
         log.warn('Circuit open, rejecting request', { topic, correlationId });
         return { success: false, error: 'Circuit open - system overloaded' };
     }
-
     const payload = { ...data };
     if (payload.text) payload.text = sanitize(payload.text);
     if (payload.message) payload.message = sanitize(payload.message);
     if (payload.dispatcher) payload.dispatcher = sanitizeUsername(payload.dispatcher);
-
     inFlightRequests++;
-
     try {
         for (let attempt = 1; attempt <= CFG.rate.retries; attempt++) {
             try {
                 await limiter.acquire();
                 const result = await robloxRequest(topic, payload, correlationId);
-
                 if (result.status >= 200 && result.status < 300) {
                     circuit.success();
                     log.debug('Roblox API success', { topic, correlationId, attempt });
                     return { success: true };
                 }
-
                 if (result.status === 429) {
                     const retry = parseInt(result.headers['retry-after'], 10);
                     const waitMs = !isNaN(retry) && retry > 0 ? retry * 1000 : CFG.rate.baseDelayMs;
@@ -405,11 +391,9 @@ async function sendToRoblox(topic, data, correlationId) {
                     await sleep(Math.min(waitMs, CFG.rate.maxDelayMs));
                     continue;
                 }
-
-                if (result.status >= 500) throw new Error(`Server error: ${result.status}`);
-
+                if (result.status >= 500) throw new Error('Server error: ' + result.status);
                 circuit.fail();
-                return { success: false, error: `HTTP ${result.status}` };
+                return { success: false, error: 'HTTP ' + result.status };
             } catch (err) {
                 log.warn('Roblox API failed', { topic, attempt, error: err.message, correlationId });
                 if (attempt < CFG.rate.retries) {
@@ -429,7 +413,7 @@ function robloxRequest(topic, data, correlationId) {
         const body = JSON.stringify({ message: JSON.stringify(data) });
         const req = https.request({
             hostname: CFG.roblox.host,
-            path: `${CFG.roblox.path}/universes/${CFG.roblox.universeId}/topics/${topic}`,
+            path: CFG.roblox.path + '/universes/' + CFG.roblox.universeId + '/topics/' + topic,
             method: 'POST',
             agent,
             headers: {
@@ -454,29 +438,22 @@ function robloxRequest(topic, data, correlationId) {
 // Embed parsing
 function parseEmbed(embed) {
     if (!embed?.title) return null;
-
     const callType = embed.title.includes('911') ? '911' : embed.title.includes('311') ? '311' : null;
     if (!callType) return null;
-
     let callId = null, status = null, callback = 'Unknown';
-
     if (embed.description) {
         const match = embed.description.match(/Call\s*ID[:\s]+([A-Za-z0-9_-]+)/i);
         if (match?.[1] && validCallId(match[1])) callId = match[1];
     }
-
     for (const field of embed.fields || []) {
         const name = (field.name || '').toLowerCase(), value = field.value || '';
-
         if (!callId && (name.includes('call id') || name.includes('callid'))) {
             const match = value.match(/([A-Za-z0-9_-]+)/);
             if (match?.[1] && validCallId(match[1])) callId = match[1];
         }
-
         if (name.includes('status')) status = value;
         else if (name.includes('callback') || name.includes('number')) callback = sanitize(value || 'Unknown');
     }
-
     return { callType, callId, status, callback };
 }
 
@@ -496,6 +473,7 @@ client.on('shardError', (error, shardId) => log.error('Discord shard error', { s
 // Message handler
 client.on('messageCreate', async msg => {
     if (!msg.author) return;
+    if (await handleWhitelistCommand(msg)) return;
     try {
         if (msg.webhookId && msg.embeds?.length) await handleIncoming(msg);
         else if (!msg.author.bot && msg.content?.trim()) await handleUser(msg);
@@ -510,42 +488,32 @@ async function handleIncoming(msg) {
         return;
     }
     processedCalls.markMessageId(msg.id);
-
     const parsed = parseEmbed(msg.embeds[0]);
     if (!parsed?.callType || !parsed.callId) {
         log.debug('Invalid embed format', { hasTitle: !!msg.embeds[0]?.title });
         return;
     }
-
     if (!parsed.status?.toUpperCase().includes('RINGING')) {
         log.debug('Ignoring non-ringing status', { status: parsed.status, callId: parsed.callId });
         return;
     }
-
     if (processedCalls.hasCallId(parsed.callId) || threads.hasCallId(parsed.callId)) {
         log.debug('Duplicate call ignored', { callId: parsed.callId });
         return;
     }
-
     const correlationId = generateCorrelationId(parsed.callId);
     processedCalls.markCallId(parsed.callId, correlationId);
-
     try {
         await discordLimiter.acquire();
         const thread = await msg.startThread({
-            name: `${parsed.callType} Call - ${parsed.callId}`.substring(0, CFG.limits.threadNameMax),
+            name: (parsed.callType + ' Call - ' + parsed.callId).substring(0, CFG.limits.threadNameMax),
             autoArchiveDuration: CFG.threads.archiveMins,
         });
-
         const threadData = threads.create(thread.id, parsed.callId, parsed.callType, correlationId);
         if (!threadData) { await thread.delete().catch(() => {}); return; }
-
         const type = parsed.callType === '911' ? 'EMERGENCY' : 'NON-EMERGENCY';
         await discordLimiter.acquire();
-        await thread.send(
-            `<@&${CFG.dispatcher}>\n**INCOMING ${parsed.callType} ${type} CALL**\n\nSend a message to answer.\n\`!hangup\` to end.`
-        );
-
+        await thread.send('<@&' + CFG.dispatcher + '>\n**INCOMING ' + parsed.callType + ' ' + type + ' CALL**\n\nSend a message to answer.\n`!hangup` to end.');
         log.info('Thread created on webhook message', { threadId: thread.id, callId: parsed.callId });
     } catch (err) {
         log.error('Thread creation failed', { error: err.message, callId: parsed.callId });
@@ -555,7 +523,6 @@ async function handleIncoming(msg) {
 async function handleUser(msg) {
     const content = msg.content.trim();
     const isThread = msg.channel.type === ChannelType.PublicThread || msg.channel.type === ChannelType.PrivateThread;
-
     if (isThread) {
         const data = threads.get(msg.channel.id);
         if (data) { await handleThread(msg, data, content); return; }
@@ -565,91 +532,79 @@ async function handleUser(msg) {
 
 async function handleThread(msg, data, content) {
     const { callId, answered, callType, correlationId } = data;
-
     if (RE.cmd.hangup.test(content)) {
         const result = await sendToRoblox('DispatcherAction', {
             callId, action: 'hangup', dispatcher: msg.author.username, threadId: msg.channel.id,
         }, correlationId);
-
         if (result.success) {
-            await msg.reply(`${callType} call ended.`);
+            await msg.reply(callType + ' call ended.');
             threads.close(msg.channel.id, 'hangup');
             await discordLimiter.acquire();
             await msg.channel.setArchived(true).catch(() => {});
         } else {
-            await msg.reply(`Failed: ${result.error}`);
+            await msg.reply('Failed: ' + result.error);
         }
         return;
     }
-
     const text = sanitize(content);
     if (!text) return;
-
     if (!answered) {
         const result = await sendToRoblox('DispatcherAction', {
             callId, action: 'answer', dispatcher: msg.author.username, message: text, threadId: msg.channel.id,
         }, correlationId);
-
         if (result.success) {
             threads.markAnswered(msg.channel.id);
             threads.recordMessage(msg.channel.id);
             await msg.reply('Connected: Message sent to caller.');
         } else {
-            await msg.reply(`Failed to connect: ${result.error}`);
+            await msg.reply('Failed to connect: ' + result.error);
         }
         return;
     }
-
     const result = await sendToRoblox('DispatcherMessage', {
         callId, text, dispatcher: msg.author.username, threadId: msg.channel.id,
     }, correlationId);
-
     if (result.success) threads.recordMessage(msg.channel.id);
-    else await msg.reply(`Failed to send: ${result.error}`);
+    else await msg.reply('Failed to send: ' + result.error);
 }
 
 async function handleCommand(msg, content) {
     if (RE.cmd.status.test(content)) {
         const s = threads.getStats();
-        await msg.reply(`**Bot Status**\nActive Calls: ${s.active}\nAnswered: ${s.answered}\nWaiting: ${s.waiting}\nCircuit: ${s.circuit.state}\nProcessed: ${s.processedCalls}`);
+        await msg.reply('**Bot Status**\nActive Calls: ' + s.active + '\nAnswered: ' + s.answered + '\nWaiting: ' + s.waiting + '\nCircuit: ' + s.circuit.state + '\nProcessed: ' + s.processedCalls);
         return;
     }
-
     if (RE.cmd.health.test(content)) {
         const s = threads.getStats(), healthy = s.circuit.state === 'CLOSED';
-        await msg.reply(`**System Health**\nStatus: ${healthy ? 'Healthy' : 'Degraded'}\nUptime: ${Math.floor(process.uptime())}s\nCircuit: ${s.circuit.state}\nIn-flight: ${inFlightRequests}`);
+        await msg.reply('**System Health**\nStatus: ' + (healthy ? 'Healthy' : 'Degraded') + '\nUptime: ' + Math.floor(process.uptime()) + 's\nCircuit: ' + s.circuit.state + '\nIn-flight: ' + inFlightRequests);
         return;
     }
-
     if (RE.cmd.help.test(content)) {
         await msg.reply('**Commands**\n`!status` - Bot status\n`!health` - System health\n`!hangup` - End call (in thread)\n`!answer <id>` - Answer manually\n`!d <id> <msg>` - Send message\n`!hangup <id>` - End specific call');
         return;
     }
-
     let match = content.match(RE.cmd.answer);
     if (match) {
         if (!validCallId(match[1])) { await msg.reply('Invalid call ID.'); return; }
         const correlationId = generateCorrelationId(match[1]);
         const result = await sendToRoblox('DispatcherAction', { callId: match[1], action: 'answer', dispatcher: msg.author.username }, correlationId);
-        await msg.reply(result.success ? 'Answer sent.' : `Failed: ${result.error}`);
+        await msg.reply(result.success ? 'Answer sent.' : 'Failed: ' + result.error);
         return;
     }
-
     match = content.match(RE.cmd.dispatch);
     if (match) {
         if (!validCallId(match[1])) { await msg.reply('Invalid call ID.'); return; }
         const correlationId = generateCorrelationId(match[1]);
         const result = await sendToRoblox('DispatcherMessage', { callId: match[1], text: sanitize(match[2]), dispatcher: msg.author.username }, correlationId);
-        await msg.reply(result.success ? 'Sent.' : `Failed: ${result.error}`);
+        await msg.reply(result.success ? 'Sent.' : 'Failed: ' + result.error);
         return;
     }
-
     match = content.match(RE.cmd.hangupId);
     if (match) {
         if (!validCallId(match[1])) { await msg.reply('Invalid call ID.'); return; }
         const correlationId = generateCorrelationId(match[1]);
         const result = await sendToRoblox('DispatcherAction', { callId: match[1], action: 'hangup', dispatcher: msg.author.username }, correlationId);
-        await msg.reply(result.success ? 'Call ended.' : `Failed: ${result.error}`);
+        await msg.reply(result.success ? 'Call ended.' : 'Failed: ' + result.error);
     }
 }
 
@@ -672,7 +627,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-const server = app.listen(CFG.port, () => log.info(`Server on port ${CFG.port}`));
+const server = app.listen(CFG.port, () => log.info('Server on port ' + CFG.port));
 
 // Graceful shutdown
 let stopping = false;
@@ -680,22 +635,17 @@ let stopping = false;
 async function shutdown(signal) {
     if (stopping) return;
     stopping = true;
-    log.info(`${signal} received, shutting down`);
-
+    log.info(signal + ' received, shutting down');
     server.close();
-
     const deadline = Date.now() + CFG.shutdownGraceMs;
     while (inFlightRequests > 0 && Date.now() < deadline) {
-        log.info(`Waiting for ${inFlightRequests} in-flight requests`);
+        log.info('Waiting for ' + inFlightRequests + ' in-flight requests');
         await sleep(500);
     }
-
-    if (inFlightRequests > 0) log.warn(`Shutdown timeout, ${inFlightRequests} requests abandoned`);
-
+    if (inFlightRequests > 0) log.warn('Shutdown timeout, ' + inFlightRequests + ' requests abandoned');
     threads.destroy();
     client.destroy();
     agent.destroy();
-
     await sleep(500);
     process.exit(0);
 }
@@ -705,7 +655,11 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('unhandledRejection', reason => log.error('Unhandled rejection', { error: reason?.message || String(reason) }));
 
 // Start
-client.once('ready', () => log.info(`Ready as ${client.user.tag}`));
+client.once('ready', async () => {
+    log.info('Ready as ' + client.user.tag);
+    await initWhitelist();
+});
+
 client.on('error', err => log.error('Client error', { error: err.message }));
 
 client.login(process.env.DISCORD_TOKEN).catch(err => {
