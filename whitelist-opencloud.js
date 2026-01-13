@@ -432,9 +432,9 @@ async function handleWhitelistCommand(msg) {
         }
         
         if (await saveWhitelist(whitelist)) {
-            await msg.reply(`Added \`${userId}\` with: ${newGuns.join(', ')}\n*Datastore successfully updated.*`);
+            await msg.reply(`Added \`${userId}\` with: ${newGuns.join(', ')}\n*Live in-game now!*`);
         } else {
-            await msg.reply(`*Failed to update DataStore.*`);
+            await msg.reply(`Failed to update DataStore`);
         }
         markProcessed(msg.id);
         return true;
