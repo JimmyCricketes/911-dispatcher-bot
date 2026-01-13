@@ -117,8 +117,19 @@ const HARDCODED_USERS = {
 // In-memory cache
 let whitelistCache = {};
 
-// Prevent duplicate message processing
-const processedMessages = new Set();
+// Prevent duplicate message processing - use global symbol for singleton
+const PROCESSED_KEY = Symbol.for('whitelist.processedMessages');
+const PROCESSING_KEY = Symbol.for('whitelist.processingMessages');
+
+if (!global[PROCESSED_KEY]) {
+    global[PROCESSED_KEY] = new Set();
+}
+if (!global[PROCESSING_KEY]) {
+    global[PROCESSING_KEY] = new Set();
+}
+
+const processedMessages = global[PROCESSED_KEY];
+const processingMessages = global[PROCESSING_KEY];
 const MAX_PROCESSED = 1000;
 
 /**
@@ -249,22 +260,32 @@ function formatList(whitelist) {
  * Handle whitelist commands
  */
 async function handleWhitelistCommand(msg) {
-    // Prevent duplicate processing FIRST
-    if (processedMessages.has(msg.id)) {
-        console.log('[Whitelist] Duplicate message blocked:', msg.id);
-        return true;
-    }
-    processedMessages.add(msg.id);
-    if (processedMessages.size > MAX_PROCESSED) {
-        const first = processedMessages.values().next().value;
-        processedMessages.delete(first);
-    }
-    
+    // Check channel and basic filters first (fast exit)
     if (msg.channel.id !== WHITELIST_CHANNEL_ID) return false;
     if (msg.author.bot) return false;
     
     const content = msg.content.trim();
     if (!content.startsWith('!whitelist')) return false;
+    
+    // Prevent duplicate processing with mutex-like pattern
+    if (processedMessages.has(msg.id)) {
+        console.log('[Whitelist] BLOCKED duplicate (already processed):', msg.id);
+        return true;
+    }
+    if (processingMessages.has(msg.id)) {
+        console.log('[Whitelist] BLOCKED duplicate (currently processing):', msg.id);
+        return true;
+    }
+    
+    // Mark as processing
+    processingMessages.add(msg.id);
+    console.log('[Whitelist] Processing message:', msg.id, 'Command:', content.substring(0, 50));
+    
+    // Cleanup old entries
+    if (processedMessages.size > MAX_PROCESSED) {
+        const first = processedMessages.values().next().value;
+        processedMessages.delete(first);
+    }
     let match;
     
     // Help
@@ -279,6 +300,7 @@ async function handleWhitelistCommand(msg) {
             '`!whitelist sync` - Force sync cache\n\n' +
             '**Available Guns:** ' + VALID_GUNS.join(', ')
         );
+        markProcessed(msg.id);
         return true;
     }
     
@@ -286,6 +308,7 @@ async function handleWhitelistCommand(msg) {
     if (CMD.list.test(content)) {
         const whitelist = await getWhitelist();
         await msg.reply('**Runtime Whitelist Entries:**\n' + formatList(whitelist));
+        markProcessed(msg.id);
         return true;
     }
     
@@ -326,6 +349,7 @@ async function handleWhitelistCommand(msg) {
         }
         
         await msg.reply(response);
+        markProcessed(msg.id);
         return true;
     }
     
@@ -333,6 +357,7 @@ async function handleWhitelistCommand(msg) {
     if (CMD.sync.test(content)) {
         whitelistCache = await getWhitelist();
         await msg.reply(`Synced ${Object.keys(whitelistCache).length} runtime entries`);
+        markProcessed(msg.id);
         return true;
     }
     
@@ -365,6 +390,7 @@ async function handleWhitelistCommand(msg) {
         } else {
             await msg.reply(`User \`${userId}\` is not whitelisted.`);
         }
+        markProcessed(msg.id);
         return true;
     }
     
@@ -377,6 +403,7 @@ async function handleWhitelistCommand(msg) {
         
         if (guns.length === 0) {
             await msg.reply(`No valid guns found. Available: ${VALID_GUNS.join(', ')}`);
+            markProcessed(msg.id);
             return true;
         }
         
@@ -397,10 +424,11 @@ async function handleWhitelistCommand(msg) {
         }
         
         if (await saveWhitelist(whitelist)) {
-            await msg.reply(`Added \`${userId}\` with: ${guns.join(', ')}\n*Update Successful*`);
+            await msg.reply(`Added \`${userId}\` with: ${guns.join(', ')}\n*Live in-game now!*`);
         } else {
             await msg.reply(`Failed to update DataStore`);
         }
+        markProcessed(msg.id);
         return true;
     }
     
@@ -414,6 +442,7 @@ async function handleWhitelistCommand(msg) {
         
         if (!whitelist[userId]) {
             await msg.reply(`User \`${userId}\` not in runtime whitelist.`);
+            markProcessed(msg.id);
             return true;
         }
         
@@ -435,16 +464,30 @@ async function handleWhitelistCommand(msg) {
         }
         
         await saveWhitelist(whitelist);
+        markProcessed(msg.id);
         return true;
     }
     
+    markProcessed(msg.id);
     return false;
+}
+
+/**
+ * Mark message as fully processed
+ */
+function markProcessed(msgId) {
+    processingMessages.delete(msgId);
+    processedMessages.add(msgId);
 }
 
 /**
  * Initialize
  */
 async function initWhitelist() {
+    // Log instance ID to detect multiple instances
+    const instanceId = Math.random().toString(36).substring(2, 8);
+    console.log(`[Whitelist] Initializing instance: ${instanceId}`);
+    
     if (!ROBLOX_UNIVERSE_ID || !ROBLOX_DATASTORE_KEY) {
         console.warn('[Whitelist] Missing ROBLOX_UNIVERSE_ID or ROBLOX_DATASTORE_KEY');
         return false;
@@ -453,6 +496,9 @@ async function initWhitelist() {
         console.warn('[Whitelist] Missing WHITELIST_CHANNEL_ID');
         return false;
     }
+    console.log(`[Whitelist] Channel ID: ${WHITELIST_CHANNEL_ID}`);
+    console.log(`[Whitelist] Universe ID: ${ROBLOX_UNIVERSE_ID}`);
+    
     try {
         whitelistCache = await getWhitelist();
         console.log(`[Whitelist] Loaded ${Object.keys(whitelistCache).length} runtime entries`);
