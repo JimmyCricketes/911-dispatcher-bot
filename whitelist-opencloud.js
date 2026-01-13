@@ -117,6 +117,10 @@ const HARDCODED_USERS = {
 // In-memory cache
 let whitelistCache = {};
 
+// Prevent duplicate message processing
+const processedMessages = new Set();
+const MAX_PROCESSED = 1000;
+
 /**
  * Make Open Cloud DataStore request
  */
@@ -247,6 +251,14 @@ function formatList(whitelist) {
 async function handleWhitelistCommand(msg) {
     if (msg.channel.id !== WHITELIST_CHANNEL_ID) return false;
     if (msg.author.bot) return false;
+    
+    // Prevent duplicate processing
+    if (processedMessages.has(msg.id)) return true;
+    processedMessages.add(msg.id);
+    if (processedMessages.size > MAX_PROCESSED) {
+        const first = processedMessages.values().next().value;
+        processedMessages.delete(first);
+    }
     
     const content = msg.content.trim();
     let match;
