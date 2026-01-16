@@ -25,7 +25,8 @@ const VALID_GUNS = [
     'M1911',
     '.38 SNUBNOSE',
     'M1928 TOMMY GUN',
-    'M1897 Shotgun'
+    'M1897 Shotgun',
+    'M1 Carbine'
 ];
 
 // Command patterns
