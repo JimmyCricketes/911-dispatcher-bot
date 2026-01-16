@@ -133,6 +133,36 @@ const processingMessages = global[PROCESSING_KEY];
 const MAX_PROCESSED = 1000;
 
 /**
+ * Fetch Roblox username from user ID
+ */
+function fetchRobloxUsername(userId) {
+    return new Promise((resolve) => {
+        const req = https.request({
+            hostname: 'users.roblox.com',
+            path: `/v1/users/${userId}`,
+            method: 'GET',
+        }, res => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                if (res.statusCode === 200) {
+                    try {
+                        const json = JSON.parse(data);
+                        resolve(json.name || null);
+                    } catch {
+                        resolve(null);
+                    }
+                } else {
+                    resolve(null);
+                }
+            });
+        });
+        req.on('error', () => resolve(null));
+        req.end();
+    });
+}
+
+/**
  * Make Open Cloud DataStore request
  */
 function datastoreRequest(method, entryKey, data = null) {
@@ -407,32 +437,41 @@ async function handleWhitelistCommand(msg) {
             return true;
         }
         
+        // Fetch username from Roblox API
+        const username = await fetchRobloxUsername(userId);
+        if (!username) {
+            await msg.reply(`Invalid user ID: \`${userId}\``);
+            markProcessed(msg.id);
+            return true;
+        }
+        
         const whitelist = await getWhitelist();
         const existing = whitelist[userId]?.guns || [];
         
         // Check for duplicates
         const newGuns = guns.filter(g => !existing.includes(g));
         if (newGuns.length === 0) {
-            await msg.reply(`User \`${userId}\` already has: ${guns.join(', ')}`);
+            await msg.reply(`User \`${userId}\` (${username}) already has: ${guns.join(', ')}`);
             markProcessed(msg.id);
             return true;
         }
         
         if (whitelist[userId]) {
             whitelist[userId].guns = [...existing, ...newGuns];
+            whitelist[userId].name = username;
             whitelist[userId].updatedBy = msg.author.username;
             whitelist[userId].updatedAt = new Date().toISOString();
         } else {
             whitelist[userId] = {
                 guns: newGuns,
-                name: null,
+                name: username,
                 addedBy: msg.author.username,
                 addedAt: new Date().toISOString(),
             };
         }
         
         if (await saveWhitelist(whitelist)) {
-            await msg.reply(`Added \`${userId}\` with: ${newGuns.join(', ')}\n*Live in-game now!*`);
+            await msg.reply(`Added \`${userId}\` (${username}) with: ${newGuns.join(', ')}\n*Datastore Updated.*`);
         } else {
             await msg.reply(`Failed to update DataStore`);
         }
