@@ -1,0 +1,54 @@
+{
+    "root": true,
+    "parser": "@typescript-eslint/parser",
+    "plugins": [
+        "@typescript-eslint"
+    ],
+    "extends": [
+        "eslint:recommended",
+        "plugin:@typescript-eslint/recommended",
+        "plugin:@typescript-eslint/recommended-requiring-type-checking"
+    ],
+    "parserOptions": {
+        "ecmaVersion": 2022,
+        "sourceType": "module",
+        "project": "./tsconfig.json"
+    },
+    "env": {
+        "node": true,
+        "es2022": true
+    },
+    "rules": {
+        "@typescript-eslint/no-unused-vars": [
+            "error",
+            {
+                "argsIgnorePattern": "^_"
+            }
+        ],
+        "@typescript-eslint/explicit-function-return-type": "off",
+        "@typescript-eslint/no-explicit-any": "warn",
+        "@typescript-eslint/no-floating-promises": "error",
+        "@typescript-eslint/no-misused-promises": "error",
+        "@typescript-eslint/await-thenable": "error",
+        "@typescript-eslint/no-unnecessary-type-assertion": "warn",
+        "@typescript-eslint/prefer-nullish-coalescing": "warn",
+        "@typescript-eslint/prefer-optional-chain": "warn",
+        "@typescript-eslint/strict-boolean-expressions": "off",
+        "no-console": "off",
+        "prefer-const": "error",
+        "no-var": "error",
+        "eqeqeq": [
+            "error",
+            "always"
+        ],
+        "curly": [
+            "error",
+            "multi-line"
+        ]
+    },
+    "ignorePatterns": [
+        "dist",
+        "node_modules",
+        "*.js"
+    ]
+}
