@@ -26,3 +26,14 @@ npm-debug.log*
 
 # Local scripts
 install-and-build.bat
+push-to-github.bat
+fix-github-repo.bat
+
+# Roblox/Lua files (Game scripts unrelated to Discord Bot source)
+*.lua
+SETUP-*.md
+SETUP.md
+
+# Legacy JS files (replaced by TypeScript)
+*.js
+!src/*.js
