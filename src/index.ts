@@ -6,6 +6,12 @@
 import { Client, GatewayIntentBits, ChannelType, Message } from 'discord.js';
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
+import dns from 'dns';
+
+// Force IPv4 to avoid IPv6 connection issues on some hosts
+if (dns.setDefaultResultOrder) {
+    dns.setDefaultResultOrder('ipv4first');
+}
 
 import {
     TOPIC, ACTION, CALL_TYPE, CIRCUIT_STATE, CLOSE_REASON,
@@ -430,6 +436,8 @@ client.once('ready', () => {
     void initWhitelist();
 });
 
+client.on('debug', (info: string) => log.debug('Discord Debug', { info }));
+client.on('warn', (info: string) => log.warn('Discord Warning', { info }));
 client.on('error', (err: Error) => log.error('Client error', { error: err.message }));
 
 // Debug: Check token
