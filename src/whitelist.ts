@@ -20,11 +20,17 @@ const ENTRY_KEY = 'whitelist_v1';
 
 // Available guns
 export const VALID_GUNS = [
-    'M1911',
+    '.38 SERVICE',
     '.38 SNUBNOSE',
+    'COLT MONITOR',
+    'M1 CARBINE',
+    'M1897 SHOTGUN',
+    'M1911',
+    'M1921/28 POLICE',
     'M1928 TOMMY GUN',
-    'M1897 Shotgun',
-    'M1 Carbine'
+    'M3 GREASE',
+    'M3 GREASE SHORT',
+    'RUGER SPEED-SIX'
 ] as const;
 
 export type ValidGun = typeof VALID_GUNS[number];
